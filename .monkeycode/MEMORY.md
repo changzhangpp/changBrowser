@@ -96,7 +96,8 @@ This file records user instructions, preferences, and teachings for reference in
 - Instructions:
   - 代码托管于 https://github.com/changzhangpp/changBrowser（public，默认 main），remote 名 `changbrowser`
   - GitHub 凭证：用户 PAT 写入 /root/.git-credentials，`git config --global credential.helper store`（常规 git 命令免密）
-  - 本地 /workspace/OpenBrowser 是上游仓库的浅克隆（--depth 1），直接 push 会报 `did not receive expected object`；推送当前程序用 orphan 快照：`git checkout --orphan <b> && git add -A && git commit && git push <url> <b>:main`
+  - 本地 /workspace/OpenBrowser 是上游仓库的浅克隆（--depth 1），直接 push 会报 `did not receive expected object`；推送当前程序用 orphan 快照：`git checkout --orphan <b> && git add -A && git commit && git push <b>:main`
+  - push 必须临时重置凭证助手（默认 agent 助手返回 500）：`git -c credential.helper= -c "credential.helper=store --file=/root/.git-credentials" push --force changbrowser <b>:main`；禁止把令牌嵌进 URL（会随 git 错误输出泄漏）；大仓库推送偶发 TLS 断连，重试并用 `ls-remote` 核对远端 main 哈希
   - 控制台/opsbox 口令不再硬编码：优先 env CONSOLE_PASSWORD/OPS_PASSWORD，其次 `<userData>/console-password.txt`（本地已写入真实口令，登录行为不变）
 - .gitignore 排除 Browserapp/kernels/chrome-stable（437M 下载内核）及 **/.secret、**/console-password.txt、**/local-api-key.txt
 

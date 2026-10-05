@@ -1,0 +1,1091 @@
+'use strict';
+
+/**
+ * Icon pipeline for OpenBrowser:
+ * - App shortcuts / Dock (software): assets/logo-pixel.svg
+ * - Browser env Dock / extension toolbar: assets/logo-native.svg + env number badge
+ */
+
+const fs = require('fs');
+const fsp = require('fs/promises');
+const path = require('path');
+const os = require('os');
+const zlib = require('zlib');
+const { spawnSync, execFileSync } = require('child_process');
+
+const APP_ROOT = path.resolve(__dirname, '..');
+const ASSETS = path.join(APP_ROOT, 'assets');
+const LOGO_PIXEL_SVG = path.join(ASSETS, 'logo-pixel.svg');
+const LOGO_NATIVE_SVG = path.join(ASSETS, 'logo-native.svg');
+const LOGO_PIXEL_PNG = path.join(ASSETS, 'logo-pixel.png');
+const LOGO_NATIVE_PNG = path.join(ASSETS, 'logo-native.png');
+const LOGO_PNG = path.join(ASSETS, 'logo.png');
+const LOGO_ICNS = path.join(ASSETS, 'logo.icns');
+
+function normalizeEnvNumber(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return '1';
+  const digits = raw.match(/\d+/);
+  if (digits) {
+    const n = Math.max(1, Math.min(999, Number(digits[0]) || 1));
+    return String(n);
+  }
+  return raw.slice(0, 3) || '1';
+}
+
+/**
+/**
+ * Pillow renderer for the brand mark: macOS Big Sur+ flat style, supersampled.
+ *
+ * Geometry is expressed as a fraction of `size` (Apple's icon grid: an 824/1024 content box
+ * centred in the canvas) so 16px and 1024px share one shape. The window shadow is scaled the
+ * same way — absolute-pixel blur used to smear across small canvases and paint white squares
+ * around the 16px slot.
+ *
+ * Falls back to a flat rounded plate when numpy is missing; the caller contract is unchanged.
+ */
+const BRAND_RENDER_PY = `
+import sys
+from pathlib import Path
+from PIL import Image, ImageDraw, ImageFilter
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+def render(size, out):
+    ss = 8 if size <= 32 else (4 if size <= 128 else 2)
+    W = size * ss
+    s = size / 1024.0
+    inset = 100.0 * s * ss
+    content = 824.0 * s * ss
+    cx = inset + content / 2.0
+
+    win_w = content * 0.660
+    win_h = content * 0.550
+    win_x = inset + (content - win_w) / 2.0
+    win_y = inset + (content - win_h) / 2.0 - content * 0.014
+    win_r = win_w * 0.088
+    bar_h = win_h * 0.215
+    blur_px = max(0.5, 13.0 * s * ss)
+    dy_px = 9.0 * s * ss
+
+    if np is None:
+        img = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, W - 1, W - 1], radius=max(1, int(round(content * 0.2237))),
+                            fill=(59, 123, 240, 255))
+    else:
+        Y, X = np.mgrid[0:W, 0:W].astype(np.float32)
+        nx = (X - cx) / (content / 2.0)
+        ny = (Y - cx) / (content / 2.0)
+        inside = (np.abs(nx) ** 4.2 + np.abs(ny) ** 4.2) <= 1.0
+
+        t = np.clip(nx * 0.5 + ny * 0.5 + 0.5, 0.0, 1.0) ** 0.95
+        c0 = np.array((111, 174, 255), dtype=np.float32)
+        c1 = np.array((27, 68, 196), dtype=np.float32)
+        rgb = c0[None, None, :] * (1 - t[..., None]) + c1[None, None, :] * t[..., None]
+
+        hy = np.clip((ny + 1.0) / 2.0, 0.0, 1.0)
+        a = (np.clip(1.0 - hy / 0.62, 0.0, 1.0) ** 1.5 * 0.16)[..., None]
+        rgb = rgb * (1 - a) + 255.0 * a
+
+        arr = np.zeros((W, W, 4), dtype=np.uint8)
+        arr[..., 0:3] = np.clip(rgb, 0, 255).astype(np.uint8)
+        arr[..., 3] = np.where(inside, 255, 0).astype(np.uint8)
+        img = Image.fromarray(arr, "RGBA")
+
+        sh = Image.new("RGBA", (W, W), (0, 0, 0, 0))
+        ImageDraw.Draw(sh).rounded_rectangle(
+            [win_x, win_y + dy_px, win_x + win_w, win_y + win_h + dy_px],
+            radius=win_r, fill=(9, 30, 92, 58))
+        img = Image.alpha_composite(img, sh.filter(ImageFilter.GaussianBlur(blur_px)))
+
+        mask = Image.fromarray(np.where(inside, 255, 0).astype(np.uint8), "L")
+        img = Image.composite(img, Image.new("RGBA", (W, W), (0, 0, 0, 0)), mask)
+
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([win_x, win_y, win_x + win_w, win_y + win_h],
+                        radius=win_r, fill=(255, 255, 255, 253))
+    bar = (235, 240, 249, 255)
+    d.rounded_rectangle([win_x, win_y, win_x + win_w, win_y + bar_h], radius=win_r, fill=bar)
+    d.rectangle([win_x, win_y + bar_h - win_r, win_x + win_w, win_y + bar_h], fill=bar)
+
+    dot_r = bar_h * 0.215
+    dot_gap = dot_r * 3.05
+    dot_x = win_x + win_w * 0.072 + dot_r
+    dot_y = win_y + bar_h / 2.0
+    for i, col in enumerate(((255, 95, 87), (254, 188, 46), (40, 200, 64))):
+        x = dot_x + i * dot_gap
+        d.ellipse([x - dot_r, dot_y - dot_r, x + dot_r, dot_y + dot_r], fill=col + (255,))
+
+    body_top = win_y + bar_h
+    body_h = win_h - bar_h
+    lh = body_h * 0.095
+    lx = win_x + win_w * 0.098
+    for ry, rw, col in ((0.19, 0.42, (37, 99, 235)),
+                        (0.465, 0.70, (205, 213, 227)),
+                        (0.735, 0.55, (205, 213, 227))):
+        y = body_top + body_h * ry
+        d.rounded_rectangle([lx, y, lx + win_w * rw, y + lh], radius=lh / 2.0, fill=col + (255,))
+
+    img = img.resize((size, size), Image.Resampling.LANCZOS)
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    img.save(out, format="PNG")
+
+
+for spec in sys.argv[1:]:
+    px, dst = spec.split("=", 1)
+    render(int(px), dst)
+print("OK")
+`;
+
+/**
+ * Batch entry point: one Python process renders every requested size.
+ * @param {string[]} specs `"<pixels>=<output path>"` pairs.
+ */
+function spawnBrandRender(specs) {
+  if (!specs.length) return false;
+  const result = spawnSync('python3', ['-c', BRAND_RENDER_PY, ...specs], {
+    encoding: 'utf8',
+    timeout: 60000,
+  });
+  if (result.status !== 0) return false;
+  return specs.every((spec) => {
+    const dst = spec.slice(spec.indexOf('=') + 1);
+    return fs.existsSync(dst) && fs.statSync(dst).size > 64;
+  });
+}
+
+/** Single-size brand mark (software shortcut icon, environment icon base). */
+function renderBrandIconPil(size, outPng) {
+  return spawnBrandRender([`${size}=${outPng}`]);
+}
+
+/**
+ * Render a whole icon set in one process. Rendering each slot natively is what keeps the 16px
+ * and 32px entries legible — downscaling the 1024 master with sips turns them into mush.
+ * @param {Array<[number, string]>} slots `[pixelSize, outputPath]` pairs.
+ */
+function renderBrandIconSet(slots) {
+  return spawnBrandRender(slots.map(([px, out]) => `${px}=${out}`));
+}
+
+/**
+ * logo-native.svg — environment icons (Dock wrappers, marker extension) reuse the brand mark.
+ */
+function renderNativeLogoPil(size, outPng) {
+  return renderBrandIconPil(size, outPng);
+}
+
+/**
+ * logo-pixel.svg — the software shortcut icon reuses the brand mark.
+ */
+function renderPixelLogoPil(size, outPng) {
+  return renderBrandIconPil(size, outPng);
+}
+
+
+/**
+ * Rasterize SVG → PNG. Prefers exact Pillow redraw; qlmanage only as last resort (often padded).
+ */
+function rasterizeSvg(svgPath, size, outPng) {
+  if (!svgPath || !fs.existsSync(svgPath)) return false;
+  const name = path.basename(svgPath).toLowerCase();
+  if (name.includes('native') && renderNativeLogoPil(size, outPng)) return true;
+  if (name.includes('pixel') && renderPixelLogoPil(size, outPng)) return true;
+  // Fallback: if a prebuilt PNG with same stem exists
+  const stem = path.basename(svgPath, path.extname(svgPath));
+  const fallback = path.join(path.dirname(svgPath), `${stem}.png`);
+  if (fs.existsSync(fallback)) {
+    try {
+      execFileSync('sips', ['-z', String(size), String(size), fallback, '--out', outPng], { stdio: 'ignore' });
+      return fs.existsSync(outPng);
+    } catch (_) {
+      try { fs.copyFileSync(fallback, outPng); return true; } catch (__) { return false; }
+    }
+  }
+  return false;
+}
+
+function ensureBaseLogoPng(kind = 'pixel', size = 1024) {
+  const cache = kind === 'native' ? LOGO_NATIVE_PNG : LOGO_PIXEL_PNG;
+  const tmp = path.join(os.tmpdir(), `ob-${kind}-${size}.png`);
+  const ok = kind === 'native'
+    ? renderNativeLogoPil(size, tmp)
+    : renderPixelLogoPil(size, tmp);
+  if (ok) {
+    try { fs.copyFileSync(tmp, cache); } catch (_) { /* assets may be read-only */ }
+    return tmp;
+  }
+  if (fs.existsSync(cache)) return cache;
+  if (kind === 'pixel' && fs.existsSync(LOGO_PNG)) return LOGO_PNG;
+  return null;
+}
+
+/**
+ * Draw env number badge on logo PNG via Pillow.
+ */
+function stampNumberOnPng(logoPath, number, size, outPng) {
+  const script = `
+import sys
+from pathlib import Path
+try:
+  from PIL import Image, ImageDraw, ImageFont
+except Exception as e:
+  print("NO_PIL", e, file=sys.stderr)
+  sys.exit(2)
+
+logo_path, number, size, out_png = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+img = Image.open(logo_path).convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
+draw = ImageDraw.Draw(img)
+label = str(number)[:3]
+# Larger corner badge so env number is readable on Dock / toolbar
+badge_r = max(20, int(size * (0.36 if len(label) <= 1 else 0.40 if len(label) == 2 else 0.44)))
+margin = max(2, int(size * 0.03))
+cx = size - badge_r // 2 - margin
+cy = size - badge_r // 2 - margin
+ring = max(2, size // 40)
+draw.ellipse(
+  (cx - badge_r // 2, cy - badge_r // 2, cx + badge_r // 2, cy + badge_r // 2),
+  fill=(0, 122, 255, 255),
+  outline=(255, 255, 255, 255),
+  width=ring,
+)
+font_size = max(11, int(badge_r * (0.78 if len(label) == 1 else 0.58 if len(label) == 2 else 0.46)))
+font = None
+for fp in (
+  "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+  "/System/Library/Fonts/SFNSRounded.ttf",
+  "/System/Library/Fonts/Helvetica.ttc",
+  "/Library/Fonts/Arial Bold.ttf",
+  "C:\\\\Windows\\\\Fonts\\\\arialbd.ttf",
+  "C:\\\\Windows\\\\Fonts\\\\segoeui.ttf",
+):
+  try:
+    font = ImageFont.truetype(fp, font_size)
+    break
+  except Exception:
+    continue
+if font is None:
+  font = ImageFont.load_default()
+bbox = draw.textbbox((0, 0), label, font=font)
+tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+draw.text((cx - tw / 2, cy - th / 2 - max(1, size // 128)), label, fill=(255, 255, 255, 255), font=font)
+Path(out_png).parent.mkdir(parents=True, exist_ok=True)
+img.save(out_png, format="PNG")
+print("OK")
+`;
+  const result = spawnSync('python3', ['-c', script, logoPath, String(number), String(size), outPng], {
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  return result.status === 0 && fs.existsSync(outPng) && fs.statSync(outPng).size > 64;
+}
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i += 1) {
+    let value = i;
+    for (let bit = 0; bit < 8; bit += 1) value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+    table[i] = value >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buffer) {
+  let crc = 0xffffffff;
+  for (const byte of buffer) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data = Buffer.alloc(0)) {
+  const name = Buffer.from(type, 'ascii');
+  const payload = Buffer.concat([name, data]);
+  const out = Buffer.alloc(12 + data.length);
+  out.writeUInt32BE(data.length, 0);
+  name.copy(out, 4);
+  data.copy(out, 8);
+  out.writeUInt32BE(crc32(payload), 8 + data.length);
+  return out;
+}
+
+function writeRgbaPng(size, pixels, outPng) {
+  const rows = [];
+  for (let y = 0; y < size; y += 1) {
+    rows.push(Buffer.from([0]));
+    rows.push(pixels.subarray(y * size * 4, (y + 1) * size * 4));
+  }
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 6;
+  const png = Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(Buffer.concat(rows), { level: 9 })),
+    pngChunk('IEND'),
+  ]);
+  fs.mkdirSync(path.dirname(outPng), { recursive: true });
+  fs.writeFileSync(outPng, png);
+}
+
+function generateFallbackPng(number, size, outPng) {
+  const pixels = Buffer.alloc(size * size * 4);
+  const set = (x, y, color) => {
+    if (x < 0 || y < 0 || x >= size || y >= size) return;
+    const index = (y * size + x) * 4;
+    pixels[index] = color[0];
+    pixels[index + 1] = color[1];
+    pixels[index + 2] = color[2];
+    pixels[index + 3] = color[3];
+  };
+  const fillRect = (x, y, w, h, color) => {
+    for (let yy = Math.max(0, y); yy < Math.min(size, y + h); yy += 1) {
+      for (let xx = Math.max(0, x); xx < Math.min(size, x + w); xx += 1) set(xx, yy, color);
+    }
+  };
+  const fillCircle = (cx, cy, radius, color) => {
+    const r2 = radius * radius;
+    for (let y = Math.floor(cy - radius); y <= Math.ceil(cy + radius); y += 1) {
+      for (let x = Math.floor(cx - radius); x <= Math.ceil(cx + radius); x += 1) {
+        const dx = x - cx;
+        const dy = y - cy;
+        if (dx * dx + dy * dy <= r2) set(x, y, color);
+      }
+    }
+  };
+
+  fillRect(0, 0, size, size, [0, 122, 255, 255]);
+  fillRect(Math.floor(size * 0.18), Math.floor(size * 0.23), Math.floor(size * 0.64), Math.floor(size * 0.52), [255, 255, 255, 245]);
+  fillRect(Math.floor(size * 0.18), Math.floor(size * 0.23), Math.floor(size * 0.64), Math.floor(size * 0.14), [232, 232, 237, 255]);
+  fillRect(Math.floor(size * 0.27), Math.floor(size * 0.47), Math.floor(size * 0.32), Math.max(1, Math.floor(size * 0.05)), [0, 122, 255, 230]);
+  fillRect(Math.floor(size * 0.27), Math.floor(size * 0.58), Math.floor(size * 0.44), Math.max(1, Math.floor(size * 0.04)), [199, 199, 204, 255]);
+
+  const label = normalizeEnvNumber(number);
+  const badge = Math.max(10, Math.floor(size * 0.38));
+  const cx = size - Math.floor(badge * 0.55);
+  const cy = size - Math.floor(badge * 0.55);
+  fillCircle(cx, cy, Math.floor(badge * 0.52), [255, 255, 255, 255]);
+  fillCircle(cx, cy, Math.floor(badge * 0.43), [17, 24, 32, 255]);
+
+  const patterns = {
+    0: ['111', '101', '101', '101', '111'],
+    1: ['010', '110', '010', '010', '111'],
+    2: ['111', '001', '111', '100', '111'],
+    3: ['111', '001', '111', '001', '111'],
+    4: ['101', '101', '111', '001', '001'],
+    5: ['111', '100', '111', '001', '111'],
+    6: ['111', '100', '111', '101', '111'],
+    7: ['111', '001', '010', '010', '010'],
+    8: ['111', '101', '111', '101', '111'],
+    9: ['111', '101', '111', '001', '111'],
+  };
+  const chars = label.replace(/\D/g, '').slice(0, 3) || '1';
+  const unit = Math.max(1, Math.floor(badge / (chars.length * 4 + 1)));
+  const totalWidth = chars.length * 3 * unit + Math.max(0, chars.length - 1) * unit;
+  const totalHeight = 5 * unit;
+  let x0 = Math.round(cx - totalWidth / 2);
+  const y0 = Math.round(cy - totalHeight / 2);
+  for (const char of chars) {
+    const pattern = patterns[char] || patterns[1];
+    for (let row = 0; row < pattern.length; row += 1) {
+      for (let col = 0; col < pattern[row].length; col += 1) {
+        if (pattern[row][col] === '1') fillRect(x0 + col * unit, y0 + row * unit, unit, unit, [255, 255, 255, 255]);
+      }
+    }
+    x0 += 4 * unit;
+  }
+
+  try {
+    writeRgbaPng(size, pixels, outPng);
+    return fs.existsSync(outPng) && fs.statSync(outPng).size > 64;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * Browser environment icon: logo-native.svg + number badge.
+ */
+function generateEnvIconPng(number, size, outPng) {
+  const label = normalizeEnvNumber(number);
+  const base = ensureBaseLogoPng('native', Math.max(size, 256));
+  if (base && stampNumberOnPng(base, label, size, outPng)) return outPng;
+  // Last resort: rasterize SVG fresh into out dir then stamp
+  const tmpBase = path.join(os.tmpdir(), `ob-native-base-${size}.png`);
+  if (rasterizeSvg(LOGO_NATIVE_SVG, size, tmpBase) && stampNumberOnPng(tmpBase, label, size, outPng)) {
+    return outPng;
+  }
+  if (generateFallbackPng(label, size, outPng)) return outPng;
+  throw new Error('Failed to generate environment icon PNG from logo-native.svg');
+}
+
+/**
+ * Software / app shortcut icon: logo-pixel.svg (no env number).
+ */
+function generateAppIconPng(size, outPng) {
+  // Render at the target size directly: downscaling a 1024 master with sips softens the
+  // traffic lights and the window edge, and the small slots are where that shows most.
+  if (renderBrandIconPil(size, outPng)) return outPng;
+  const base = ensureBaseLogoPng('pixel', Math.max(size, 256));
+  if (base) {
+    try {
+      execFileSync('sips', ['-z', String(size), String(size), base, '--out', outPng], { stdio: 'ignore' });
+      if (fs.existsSync(outPng)) return outPng;
+    } catch (_) {
+      fs.copyFileSync(base, outPng);
+      return outPng;
+    }
+  }
+  if (rasterizeSvg(LOGO_PIXEL_SVG, size, outPng)) return outPng;
+  throw new Error('Failed to generate app icon from logo-pixel.svg');
+}
+
+/**
+ * Build an .icns from a master PNG.
+ *
+ * @param {string} pngPath master PNG.
+ * @param {string} icnsPath destination .icns.
+ * @param {(slots: Array<{px: number, out: string}>) => boolean} [renderSlots] optional batched
+ *   native renderer. When it fills the slots, sips is skipped — downscaling a 1024 master
+ *   leaves the 16px entry as a blob, and that is the size Finder and Spotlight fall back to.
+ */
+function pngToIcns(pngPath, icnsPath, renderSlots) {
+  if (process.platform !== 'darwin') return null;
+  const iconset = icnsPath.replace(/\.icns$/i, '.iconset');
+  try {
+    fs.rmSync(iconset, { recursive: true, force: true });
+    fs.mkdirSync(iconset, { recursive: true });
+    // The full macOS iconset grid. The previous list stopped at 512 and emitted a
+    // non-standard icon_64x64.png while skipping icon_512x512@2x.png, so the Dock had no
+    // 1024 slot and upscaled the 512 one.
+    const grid = [[16, 1], [16, 2], [32, 1], [32, 2], [128, 1], [128, 2], [256, 1], [256, 2], [512, 1], [512, 2]];
+    const plan = grid.map(([base, scale]) => ({
+      px: base * scale,
+      out: path.join(iconset, `icon_${base}x${base}${scale === 2 ? '@2x' : ''}.png`),
+    }));
+    let filled = false;
+    if (typeof renderSlots === 'function') {
+      try { filled = renderSlots(plan) === true; } catch (_) { filled = false; }
+    }
+    for (const { px, out } of plan) {
+      if (filled && fs.existsSync(out)) continue;
+      execFileSync('sips', ['-z', String(px), String(px), pngPath, '--out', out], { stdio: 'ignore' });
+    }
+    execFileSync('iconutil', ['-c', 'icns', iconset, '-o', icnsPath], { stdio: 'ignore' });
+    fs.rmSync(iconset, { recursive: true, force: true });
+    return fs.existsSync(icnsPath) ? icnsPath : null;
+  } catch (_) {
+    try { fs.rmSync(iconset, { recursive: true, force: true }); } catch (__) {}
+    return null;
+  }
+}
+
+/**
+ * Rebuild assets/logo.png + logo.icns (+ logo-pixel.png) from logo-pixel.svg.
+ * Used by brand-host-dev / packaging / Dock of the app itself.
+ */
+/**
+ * Multi-resolution .ico for the Windows shell (build-native.ps1, package-portable).
+ * Pillow resamples each slot from the master with LANCZOS.
+ */
+function writeMultiSizeIco(srcPng, icoPath) {
+  const script = `
+import sys
+from PIL import Image
+src, out = sys.argv[1], sys.argv[2]
+Image.open(src).convert("RGBA").save(
+    out, format="ICO",
+    sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+print("OK")
+`;
+  const result = spawnSync('python3', ['-c', script, srcPng, icoPath], { encoding: 'utf8', timeout: 30000 });
+  return result.status === 0 && fs.existsSync(icoPath) && fs.statSync(icoPath).size > 64;
+}
+
+/**
+ * True when every shortcut-icon output is at least as new as the vector source.
+ * The master PNG lives in tmpdir and is intentionally not part of this check.
+ */
+function appIconOutputsFresh() {
+  try {
+    const source = fs.statSync(LOGO_PIXEL_SVG).mtimeMs;
+    return [LOGO_PIXEL_PNG, LOGO_PNG, LOGO_ICNS,
+            path.join(ASSETS, 'logo-512.png'), path.join(ASSETS, 'logo.ico')]
+      .every((file) => {
+        try { return fs.statSync(file).mtimeMs >= source; } catch (_) { return false; }
+      });
+  } catch (_) {
+    return false;
+  }
+}
+
+function rebuildAppShortcutIcons({ force = false } = {}) {
+  const master = path.join(os.tmpdir(), 'ob-app-logo-1024.png');
+  // main.js calls this on every launch. Rendering the master plus ten iconset slots and an
+  // .ico costs seconds, and the result only changes when the vector source does.
+  if (!force && appIconOutputsFresh()) {
+    return { master, logoPng: LOGO_PNG, logoIcns: LOGO_ICNS, logoPixelPng: LOGO_PIXEL_PNG, cached: true };
+  }
+  generateAppIconPng(1024, master);
+  try {
+    fs.copyFileSync(master, LOGO_PIXEL_PNG);
+    fs.copyFileSync(master, LOGO_PNG);
+    // convenient 512 for UI
+    const p512 = path.join(ASSETS, 'logo-512.png');
+    try {
+      execFileSync('sips', ['-z', '512', '512', master, '--out', p512], { stdio: 'ignore' });
+    } catch (_) {}
+    // Render every iconset slot natively in one Python pass; the 1024 slot reuses the master
+    // instead of paying for a second full-size render.
+    pngToIcns(master, LOGO_ICNS, (plan) => {
+      const big = plan.filter(({ px }) => px >= 1024);
+      const rest = plan.filter(({ px }) => px < 1024);
+      let ok = renderBrandIconSet(rest.map(({ px, out }) => [px, out]));
+      for (const { out } of big) {
+        try { fs.copyFileSync(master, out); } catch (_) { ok = false; }
+      }
+      return ok;
+    });
+    writeMultiSizeIco(master, path.join(ASSETS, 'logo.ico'));
+  } catch (error) {
+    // If assets dir not writable, still return master path for callers
+    return { master, error: error.message };
+  }
+  return { master, logoPng: LOGO_PNG, logoIcns: LOGO_ICNS, logoPixelPng: LOGO_PIXEL_PNG };
+}
+
+/**
+ * Both artifacts below are rebuilt from scratch on every launch, and rebuilding means
+ * shelling out to python3/Pillow (and on macOS also sips, iconutil and lsregister). Measured
+ * on a warm start that was ~2.9s — about 40% of the whole launch — spent before the browser
+ * process is even spawned. The output only depends on the environment number and the kernel
+ * being wrapped, so a stamp lets an unchanged environment reuse what is already on disk.
+ *
+ * Bump ARTIFACT_STAMP_VERSION whenever the generated layout changes, so upgrades rebuild.
+ */
+// v2: the Dock wrapper now strips CFBundleIconName, so wrappers built by v1 must be rebuilt
+// or they keep resolving their icon out of the kernel's asset catalog.
+// v3: do not inject --no-proxy-server (it overrides Chromium --proxy-server and leaks the real IP).
+const ARTIFACT_STAMP_VERSION = 4;
+
+/** True when the stamp matches and every expected output is still present. */
+function artifactIsFresh(stampPath, key, outputs) {
+  try {
+    if (fs.readFileSync(stampPath, 'utf8') !== key) return false;
+  } catch (_) {
+    return false;
+  }
+  return outputs.every((file) => {
+    try { return fs.existsSync(file); } catch (_) { return false; }
+  });
+}
+
+function writeArtifactStamp(stampPath, key) {
+  try { fs.writeFileSync(stampPath, key, 'utf8'); } catch (_) {}
+}
+
+/**
+ * Per-profile marker extension: toolbar icon = logo-native + number.
+ * In-page floating badge also shows the number (extension content script).
+ */
+async function prepareMarkerExtension({ profileId, envNumber, userDataPath, templateDir }) {
+  const label = normalizeEnvNumber(envNumber);
+  const dest = path.join(userDataPath, 'env-markers', String(profileId || 'env'), 'extension');
+  await fsp.mkdir(dest, { recursive: true });
+
+  // Icons are a pure function of the label; regenerating them costs four python3 spawns.
+  const stampPath = path.join(dest, '.artifact-stamp');
+  const stampKey = JSON.stringify({ v: ARTIFACT_STAMP_VERSION, label });
+  const expected = [16, 32, 48, 128].map((size) => path.join(dest, `icon-${size}.png`))
+    .concat([path.join(dest, 'manifest.json'), path.join(dest, 'marker.js')]);
+  if (artifactIsFresh(stampPath, stampKey, expected)) return dest;
+
+  const sizes = [16, 32, 48, 128];
+  for (const size of sizes) {
+    generateEnvIconPng(label, size, path.join(dest, `icon-${size}.png`));
+  }
+
+  const manifest = {
+    manifest_version: 3,
+    name: `环境 ${label}`,
+    version: '1.0.2',
+    description: `环境 ${label}（浏览器图标编号）`,
+    action: {
+      default_title: `环境 ${label}`,
+      default_icon: {
+        16: 'icon-16.png',
+        32: 'icon-32.png',
+        48: 'icon-48.png',
+        128: 'icon-128.png',
+      },
+    },
+    icons: {
+      16: 'icon-16.png',
+      32: 'icon-32.png',
+      48: 'icon-48.png',
+      128: 'icon-128.png',
+    },
+    content_scripts: [
+      {
+        matches: ['http://*/*', 'https://*/*'],
+        js: ['marker.js'],
+        run_at: 'document_idle',
+      },
+    ],
+  };
+  await fsp.writeFile(path.join(dest, 'manifest.json'), JSON.stringify(manifest, null, 2), 'utf8');
+
+  // Environment marker: number is displayed on the browser toolbar icon.
+  // In-page DOM injection omitted to avoid page-visible fingerprinting.
+  const markerJs = `// Environment marker content script\n`;
+  await fsp.writeFile(path.join(dest, 'marker.js'), markerJs, 'utf8');
+
+  if (templateDir) {
+    await fsp.writeFile(path.join(dest, '.source-template'), String(templateDir), 'utf8').catch(() => {});
+  }
+  writeArtifactStamp(stampPath, stampKey);
+  return dest;
+}
+
+async function forceSymlink(target, linkPath) {
+  try { await fsp.rm(linkPath, { recursive: true, force: true }); } catch (_) {}
+  await fsp.symlink(target, linkPath);
+}
+
+/**
+ * Resolve real kernel layout from browser.path (OpenBrowser launcher or .bin).
+ * macOS Dock icon follows the .app that owns the running executable path.
+ * A thin `exec /path/to/real/OpenBrowser` wrapper DOES NOT change Dock icon —
+ * we must run OpenBrowser.bin from inside an env-specific .app that has our icns.
+ */
+function resolveKernelLayout(realBinary) {
+  const resolved = path.resolve(realBinary);
+  let realMacOS = path.dirname(resolved);
+  if (path.basename(resolved) === 'OpenBrowser.bin' || path.basename(resolved) === 'OpenBrowser') {
+    realMacOS = path.dirname(resolved);
+  }
+  // If path points at .app itself
+  if (resolved.endsWith('.app')) {
+    realMacOS = path.join(resolved, 'Contents', 'MacOS');
+  }
+  const realContents = path.dirname(realMacOS);
+  const realApp = path.dirname(realContents);
+  const realBin = path.join(realMacOS, 'OpenBrowser.bin');
+  // kernels/openbrowser (for init_template + ipc-stub): MacOS → Contents → App → openbrowser_148 → chrome_148 → openbrowser
+  const kernelRoot = path.resolve(realMacOS, '../../../../..');
+  return {
+    realMacOS,
+    realContents,
+    realApp,
+    realBin: fs.existsSync(realBin) ? realBin : resolved,
+    kernelRoot,
+    frameworks: path.join(realContents, 'Frameworks'),
+    resources: path.join(realContents, 'Resources'),
+  };
+}
+
+/**
+ * macOS: per-env Chromium .app shell so Dock shows logo-native + number.
+ * Structure (symlinks keep size small):
+ *   环境 N.app/Contents/
+ *     Frameworks -> real Frameworks
+ *     Resources/* -> real Resources (icns overwritten with env icon)
+ *     MacOS/OpenBrowser.bin -> real bin
+ *     MacOS/OpenBrowser      = launcher (runs bin FROM this bundle)
+ */
+async function prepareMacDockWrapper({
+  profileId,
+  envNumber,
+  userDataPath,
+  realBinary,
+}) {
+  if (process.platform !== 'darwin' || !realBinary || !fs.existsSync(realBinary)) return null;
+  const label = normalizeEnvNumber(envNumber);
+  const appName = `环境 ${label}`;
+  const layout = resolveKernelLayout(realBinary);
+  if (!fs.existsSync(layout.realBin)) return null;
+
+  const appRoot = path.join(userDataPath, 'env-apps', String(profileId || label), `${appName}.app`);
+  const contents = path.join(appRoot, 'Contents');
+  const macOS = path.join(contents, 'MacOS');
+  const resources = path.join(contents, 'Resources');
+  const launcherPath = path.join(macOS, 'OpenBrowser');
+
+  // Reuse the wrapper when nothing that shapes it has changed. Keyed on the kernel binary
+  // too, so pointing the profile at a different kernel still forces a clean rebuild — the
+  // wrapper symlinks into that kernel's Frameworks and would otherwise go stale.
+  const stampPath = path.join(appRoot, '.artifact-stamp');
+  const stampKey = JSON.stringify({
+    v: ARTIFACT_STAMP_VERSION,
+    label,
+    realBin: layout.realBin,
+    frameworks: layout.frameworks,
+  });
+  if (artifactIsFresh(stampPath, stampKey, [
+    launcherPath,
+    path.join(contents, 'Info.plist'),
+    path.join(resources, 'app.icns'),
+  ])) {
+    return launcherPath;
+  }
+
+  // Rebuild shell cleanly so we never keep a thin exec-wrapper
+  await fsp.rm(appRoot, { recursive: true, force: true }).catch(() => {});
+  await fsp.mkdir(macOS, { recursive: true });
+  await fsp.mkdir(resources, { recursive: true });
+
+  // Frameworks (Helpers live here — required)
+  if (fs.existsSync(layout.frameworks)) {
+    await forceSymlink(layout.frameworks, path.join(contents, 'Frameworks'));
+  }
+
+  // Resources: link real assets, then replace icons with env-numbered logo-native
+  if (fs.existsSync(layout.resources)) {
+    for (const name of fs.readdirSync(layout.resources)) {
+      await forceSymlink(path.join(layout.resources, name), path.join(resources, name));
+    }
+  }
+  const png512 = path.join(macOS, `.env-icon-${label}.png`);
+  generateEnvIconPng(label, 512, png512);
+  const icnsPath = path.join(resources, 'app.icns');
+  // Remove symlink before writing real icon files
+  for (const iconName of ['app.icns', 'AppIcon_store.icns', 'AppIcon_wb.icns']) {
+    try { await fsp.rm(path.join(resources, iconName), { force: true }); } catch (_) {}
+  }
+  pngToIcns(png512, icnsPath);
+  if (!fs.existsSync(icnsPath)) {
+    try { execFileSync('sips', ['-s', 'format', 'icns', png512, '--out', icnsPath], { stdio: 'ignore' }); } catch (_) {}
+  }
+  if (fs.existsSync(icnsPath)) {
+    for (const iconName of ['AppIcon_store.icns', 'AppIcon_wb.icns']) {
+      try { await fsp.copyFile(icnsPath, path.join(resources, iconName)); } catch (_) {}
+    }
+  }
+  // Keep a PNG preview in Resources for debugging
+  try { await fsp.copyFile(png512, path.join(resources, 'env-icon.png')); } catch (_) {}
+
+  // MacOS payloads: OpenBrowser.bin MUST be a real file under this .app.
+  // Symlink back to the kernel .app makes Dock resolve the kernel icon (Chrome/Hub mark)
+  // — never fall back to that path (see CODE_OVERVIEW §4B.2).
+  {
+    const src = path.join(layout.realMacOS, 'OpenBrowser.bin');
+    const dest = path.join(macOS, 'OpenBrowser.bin');
+    if (!fs.existsSync(src)) {
+      throw new Error('Dock shell: kernel OpenBrowser.bin missing at ' + src);
+    }
+    try { await fsp.rm(dest, { force: true }); } catch (_) {}
+    try {
+      await fsp.copyFile(src, dest);
+      await fsp.chmod(dest, 0o755);
+    } catch (error) {
+      throw new Error(
+        'Dock shell requires a real OpenBrowser.bin copy under the env app (refusing kernel symlink): '
+        + (error && error.message ? error.message : error)
+      );
+    }
+    // Hard-fail if something re-created a symlink
+    try {
+      const st = await fsp.lstat(dest);
+      if (st.isSymbolicLink()) {
+        throw new Error('Dock shell OpenBrowser.bin must not be a symlink');
+      }
+    } catch (error) {
+      if (/must not be a symlink|refusing kernel/.test(String(error.message || error))) throw error;
+      throw new Error('Dock shell OpenBrowser.bin verify failed: ' + (error.message || error));
+    }
+  }
+  for (const name of ['libskit.dylib', 'analysis', 'webdriver', 'main.dat']) {
+    const src = path.join(layout.realMacOS, name);
+    if (fs.existsSync(src)) await forceSymlink(src, path.join(macOS, name));
+  }
+
+  // PkgInfo
+  try {
+    const pkg = path.join(layout.realContents, 'PkgInfo');
+    if (fs.existsSync(pkg)) await fsp.copyFile(pkg, path.join(contents, 'PkgInfo'));
+    else await fsp.writeFile(path.join(contents, 'PkgInfo'), 'APPLCr24', 'utf8');
+  } catch (_) {}
+
+  // Info.plist: MUST keep kernel identity (Bundle ID + NSPrincipalClass) or Helpers die → black window.
+  // Only display name / icon differ so Dock shows 环境 N + logo-native badge.
+  const realPlistPath = path.join(layout.realContents, 'Info.plist');
+  let plistBody = '';
+  try {
+    plistBody = await fsp.readFile(realPlistPath, 'utf8');
+  } catch (_) {
+    plistBody = '';
+  }
+  const looksLikeXmlPlist = plistBody.includes('<?xml') || plistBody.includes('<plist') || plistBody.includes('<key>CFBundleIdentifier</key>');
+  if (plistBody && looksLikeXmlPlist && plistBody.includes('CFBundleIdentifier')) {
+    const xmlEscape = (value) => String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    const patch = (key, value) => {
+      const re = new RegExp(`(<key>${key}<\\/key>\\s*<string>)[^<]*(<\\/string>)`);
+      if (re.test(plistBody)) plistBody = plistBody.replace(re, `$1${xmlEscape(value)}$2`);
+    };
+    const removeKey = (key) => {
+      const re = new RegExp(`[\\t ]*<key>${key}<\\/key>\\s*<string>[^<]*<\\/string>\\s*\\n?`, 'g');
+      plistBody = plistBody.replace(re, '');
+    };
+    patch('CFBundleDisplayName', appName);
+    patch('CFBundleName', appName);
+    patch('CFBundleIconFile', 'app.icns');
+    // The kernel plist also carries CFBundleIconName, which names an icon inside Assets.car —
+    // and that asset-catalog key outranks CFBundleIconFile on modern macOS. Since Assets.car
+    // is symlinked straight from the kernel, leaving the key in means the Dock keeps drawing
+    // the kernel's plain icon and the per-environment number never shows. Drop it so the
+    // generated app.icns (logo + number badge) is what macOS resolves.
+    removeKey('CFBundleIconName');
+    // Keep CFBundleIdentifier compatible with kernel Helpers / Mach rendezvous
+    // Keep NSPrincipalClass = BrowserCrApplication
+    await fsp.writeFile(path.join(contents, 'Info.plist'), plistBody, 'utf8');
+  } else {
+    // Minimal fallback keeps the kernel-required bundle id + BrowserCrApplication
+    const fallback = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleDisplayName</key><string>${appName}</string>
+  <key>CFBundleExecutable</key><string>OpenBrowser</string>
+  <key>CFBundleIconFile</key><string>app.icns</string>
+  <key>CFBundleIdentifier</key><string>org.HongKongZiXun.HubStudio</string>
+  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+  <key>CFBundleName</key><string>${appName}</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>148.0.7778.165</string>
+  <key>CFBundleSignature</key><string>Cr24</string>
+  <key>CFBundleVersion</key><string>7778.165</string>
+  <key>LSMinimumSystemVersion</key><string>10.13</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>BrowserCrApplication</string>
+  <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
+</dict>
+</plist>
+`;
+    await fsp.writeFile(path.join(contents, 'Info.plist'), fallback, 'utf8');
+  }
+
+  // Launcher: same duties as kernel script. CRITICAL: use exec so OpenBrowser.bin
+  // replaces this process and becomes the .app main process (Helpers need that).
+  const kernelRoot = layout.kernelRoot;
+  const launcher = path.join(macOS, 'OpenBrowser');
+  const script = `#!/bin/bash
+# Env Dock shell — exec into OpenBrowser.bin so Helpers/Mach rendezvous work; Dock uses this .app icon.
+set -u
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REAL="\${HERE}/OpenBrowser.bin"
+KERNEL_ROOT=${JSON.stringify(kernelRoot)}
+LOG_DIR="\${HOME}/Library/Application Support/openbrowser/logs"
+mkdir -p "\$LOG_DIR" 2>/dev/null || true
+LOG="\${LOG_DIR}/kernel-launch.log"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] env=${label} $*" >>"\$LOG" 2>/dev/null || true; }
+
+if [[ ! -e "\$REAL" ]]; then
+  log "FATAL missing OpenBrowser.bin in env app"; exit 127
+fi
+if [[ -f "\${HERE}/libskit.dylib" ]]; then SKIT="\${HERE}/libskit.dylib"
+elif [[ -f "\${KERNEL_ROOT}/libskit.dylib" ]]; then SKIT="\${KERNEL_ROOT}/libskit.dylib"
+else SKIT=""; fi
+TEMPLATE="\${KERNEL_ROOT}/init_template.json"
+IPC_STUB="\${KERNEL_ROOT}/ipc-stub.py"
+
+for a in "\$@"; do
+  case "\$a" in
+    --version|-version|--product-version)
+      if [[ -n "\$SKIT" ]]; then exec env -u DYLD_INSERT_LIBRARIES DYLD_INSERT_LIBRARIES="\$SKIT" "\$REAL" --product-version
+      else exec env -u DYLD_INSERT_LIBRARIES "\$REAL" --product-version; fi ;;
+  esac
+done
+
+USER_DATA=""; HAS_STORE=0; HAS_BROWSER_ID=0; HAS_NO_SANDBOX=0; HAS_MOCK=0; HAS_REMOTE=0; HAS_DDE=0
+for a in "\$@"; do
+  case "\$a" in
+    --user-data-dir=*) USER_DATA="\${a#--user-data-dir=}" ;;
+    --store_data_path=*) HAS_STORE=1 ;;
+    --browser_id=*) HAS_BROWSER_ID=1 ;;
+    --no-sandbox) HAS_NO_SANDBOX=1 ;;
+    --use-mock-keychain) HAS_MOCK=1 ;;
+    --remote-allow-origins=*) HAS_REMOTE=1 ;;
+    --do-not-de-elevate) HAS_DDE=1 ;;
+  esac
+done
+
+log "launch user_data=\${USER_DATA:-} dock_app=\${HERE}/../.. args=\$#"
+EXTRA=()
+BROWSER_ID_VAL=""
+
+if [[ -n "\$USER_DATA" ]]; then
+  mkdir -p "\$USER_DATA" 2>/dev/null || true
+  rm -f "\$USER_DATA/SingletonLock" "\$USER_DATA/SingletonCookie" "\$USER_DATA/SingletonSocket" "\$USER_DATA/DevToolsActivePort" 2>/dev/null || true
+  if command -v python3 >/dev/null 2>&1; then
+    BROWSER_ID_VAL=\$(python3 - "\$TEMPLATE" "\$USER_DATA/init.json" <<'PY' 2>>"\$LOG" || true
+import base64, json, sys
+from pathlib import Path
+template, out = Path(sys.argv[1]), Path(sys.argv[2])
+def load_init(path: Path):
+    if not path.is_file():
+        return {}
+    raw = path.read_bytes().strip()
+    try:
+        data = base64.b64decode(raw, validate=False)
+        if data[:1] == b"{":
+            return json.loads(data)
+    except Exception:
+        pass
+    try:
+        if raw[:1] == b"{":
+            return json.loads(raw)
+    except Exception:
+        pass
+    return {}
+init = load_init(out)
+if not init and template.is_file():
+    try: init = json.loads(template.read_text(encoding="utf-8"))
+    except Exception: init = {}
+if not isinstance(init, dict): init = {}
+init["proxy"] = {}
+init["async_proxy_data"] = 0
+init["async_proxy_data_wait_page"] = ""
+init["is_garble_dom_event_trusted"] = False
+init["is_hubstudio"] = False
+init["black_white_list"] = {"black_list": [], "exception_list": [], "tips": "", "type": 1}
+init["local_port"] = {"type": 0, "black_list": [], "white_list": []}
+init["launcher_page"] = "about:blank"
+init["home_page"] = ""
+init["page_info_enabled"] = False
+init["address_bar_custom"] = []
+init["framework_url_entry"] = {
+    "password_manage": "chrome://password-manager/",
+    "history": "chrome://history/",
+    "extension_management": "chrome://extensions/",
+    "setting": "chrome://settings/",
+    "app_center": "chrome://extensions/",
+}
+init.setdefault("product_infos", {})["product_name"] = "OpenBrowser"
+init.setdefault("sa_analysis", {})
+init["sa_analysis"]["sa_product"] = "chromium"
+init["sa_analysis"]["sa_productVer"] = "148.0.0.0"
+init["required_enabled_extension_id_list"] = []
+ipc = init.get("ipc") if isinstance(init.get("ipc"), dict) else {}
+win = str(ipc.get("browser_window_name") or "").strip() or "SB171550832"
+ipc = {
+    "browser_window_name": win,
+    "from_client": str(ipc.get("from_client") or f"/tmp/{win}"),
+    "from_client_pipe": str(ipc.get("from_client_pipe") or win),
+    "is_pipe": True,
+    "rnclient_window_name": str(ipc.get("rnclient_window_name") or f"{win}listen"),
+    "to_client": str(ipc.get("to_client") or f"/tmp/{win}listen"),
+    "to_client_pipe": str(ipc.get("to_client_pipe") or f"{win}listen"),
+}
+init["ipc"] = ipc
+cl = init.get("cmd_line") if isinstance(init.get("cmd_line"), dict) else {}
+cl["remote-debugging-port"] = "0"
+# Forensic audit: ensure enable-automation is never set in cmd_line
+cl.pop("enable-automation", None)
+init["cmd_line"] = cl
+# OpenBrowser local automation: can_webdriver gates DevToolsHttpHandler (HTTP/WS)
+# in HubStudio Framework (0x6071fbd/0x6072aec). Must be True for CDP without leaking to JS.
+init["can_webdriver"] = True
+init["allow_remote_debugging"] = True
+if not init.get("token"): init["token"] = "openbrowser-token"
+plain = json.dumps(init, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+out.write_bytes(base64.b64encode(plain))
+print(win)
+PY
+)
+    BROWSER_ID_VAL=\$(printf '%s\\n' "\$BROWSER_ID_VAL" | head -1 | tr -d '\\r')
+    log "init window/browser_id=\${BROWSER_ID_VAL}"
+  fi
+  if [[ "\$HAS_STORE" -eq 0 ]]; then
+    STORE=\$(python3 -c "import base64,sys; print(base64.b64encode(sys.argv[1].encode()).decode())" "\$USER_DATA" 2>>"\$LOG" || true)
+    [[ -n "\${STORE:-}" ]] && EXTRA+=(--store_data_path="\$STORE")
+  fi
+  if [[ "\$HAS_BROWSER_ID" -eq 0 ]]; then
+    [[ -z "\${BROWSER_ID_VAL:-}" ]] && BROWSER_ID_VAL="SB171550832"
+    EXTRA+=(--browser_id="\$BROWSER_ID_VAL")
+  fi
+fi
+
+[[ "\$HAS_NO_SANDBOX" -eq 0 ]] && EXTRA+=(--no-sandbox)
+[[ "\$HAS_MOCK" -eq 0 ]] && EXTRA+=(--use-mock-keychain)
+[[ "\$HAS_REMOTE" -eq 0 ]] && EXTRA+=(--remote-allow-origins=*)
+[[ "\$HAS_DDE" -eq 0 ]] && EXTRA+=(--do-not-de-elevate)
+
+# IPC stub detached (survives exec); next launch re-binds the same sockets
+if [[ -n "\${BROWSER_ID_VAL:-}" ]] && command -v python3 >/dev/null 2>&1 && [[ -f "\$IPC_STUB" ]]; then
+  # drop previous stub holders of this window name
+  if command -v pkill >/dev/null 2>&1 && [[ -n "\${BROWSER_ID_VAL:-}" ]]; then
+    # Anchor end so SB123 does not kill SB1234
+    pkill -f "ipc-stub\\.py \${BROWSER_ID_VAL}( |$)" 2>/dev/null || true
+  fi
+  python3 "\$IPC_STUB" "\$BROWSER_ID_VAL" >>"\$LOG" 2>&1 &
+  disown 2>/dev/null || true
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if [[ -S "/tmp/\${BROWSER_ID_VAL}" || -S "/tmp/\${BROWSER_ID_VAL}listen" ]]; then break; fi
+    sleep 0.05
+  done
+  log "ipc-stub ready window=\${BROWSER_ID_VAL}"
+fi
+
+log "exec REAL (replace shell) extras=\${#EXTRA[@]}"
+# exec: OpenBrowser.bin becomes this .app's main process — required for GPU/renderer Helpers
+if [[ -n "\$SKIT" ]]; then
+  exec env -u DYLD_INSERT_LIBRARIES DYLD_INSERT_LIBRARIES="\$SKIT" "\$REAL" "\${EXTRA[@]}" "\$@"
+else
+  exec env -u DYLD_INSERT_LIBRARIES "\$REAL" "\${EXTRA[@]}" "\$@"
+fi
+`;
+  await fsp.writeFile(launcher, script, 'utf8');
+  await fsp.chmod(launcher, 0o755);
+
+  try { execFileSync('touch', [appRoot], { stdio: 'ignore' }); } catch (_) {}
+  try {
+    execFileSync('/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister', [
+      '-f', '-R', appRoot,
+    ], { stdio: 'ignore' });
+  } catch (_) {}
+
+  writeArtifactStamp(stampPath, stampKey);
+  return launcher;
+}
+
+/** Sync bundled-extension template icons to logo-native (no number; per-env copies get numbers). */
+function rebuildBundledExtensionIcons() {
+  const dir = path.join(APP_ROOT, 'bundled-extension');
+  if (!fs.existsSync(dir)) return;
+  const base = ensureBaseLogoPng('native', 256);
+  if (!base) return;
+  for (const size of [16, 32, 48, 128]) {
+    const out = path.join(dir, `icon-${size}.png`);
+    try {
+      execFileSync('sips', ['-z', String(size), String(size), base, '--out', out], { stdio: 'ignore' });
+    } catch (_) {
+      try { fs.copyFileSync(base, out); } catch (__) {}
+    }
+  }
+}
+
+module.exports = {
+  normalizeEnvNumber,
+  generateEnvIconPng,
+  generateAppIconPng,
+  prepareMarkerExtension,
+  prepareMacDockWrapper,
+  pngToIcns,
+  rebuildAppShortcutIcons,
+  rebuildBundledExtensionIcons,
+  rasterizeSvg,
+  renderBrandIconPil,
+  renderBrandIconSet,
+  writeMultiSizeIco,
+  LOGO_PIXEL_SVG,
+  LOGO_NATIVE_SVG,
+};

@@ -1,0 +1,2459 @@
+const { app, BrowserWindow, Menu, clipboard, dialog, globalShortcut, ipcMain, nativeImage, screen, session, shell, Tray } = require('./host-bridge');
+const path = require('path');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const { pathToFileURL } = require('url');
+const { spawn, execFile } = require('child_process');
+const { randomUUID } = require('crypto');
+const cdp = require('./cdp');
+const { BrowserEngine } = require('./engine');
+const { LiveSyncController } = require('./live-sync-v5');
+
+// Host process performance (Win / macOS / Linux): cut background timers and idle GPU work.
+try {
+  app.commandLine.appendSwitch('disable-renderer-backgrounding');
+  app.commandLine.appendSwitch('disable-background-timer-throttling');
+  app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
+  // Linux/X11 的原生遮挡计算会让被遮挡窗口停止 screencast 推帧，
+  // 导致 Web 控制台查看被遮挡实例时永远收不到画面
+  try { app.commandLine.appendSwitch('disable-features', 'CalculateNativeWinOcclusion'); } catch (_) {}
+  if (process.env.OPENBROWSER_LOW_POWER === '1') {
+    app.commandLine.appendSwitch('disable-gpu');
+    app.commandLine.appendSwitch('disable-software-rasterizer');
+  }
+} catch (_) {}
+
+const { compareVersions } = require('./automation/version-compare');
+const { planGridFor, minHeightFor } = require('./automation/window-arrangement');
+const { attachShellNavigationGuard } = require('./automation/shell-guard');
+const { fetchStoreEntries } = require('./automation/store-fetch');
+const { createCoalescedWriter } = require('./automation/coalesced-writer');
+const { deepEqual } = require('./automation/object-utils');
+const { startAutomation } = require('./automation');
+const cloudSync = require('./automation/cloud-sync');
+const { validateDataRootIsolationSecure, ensureDataRootIsolationSecure, assertProfileId } = require('./automation/isolation');
+const { createCrashHandler, buildHelperProcessGoneReport } = require('./automation/crash-report');
+const { writeBrowserStartupDiagnostic } = require('./engine/diagnostics');
+
+const appDataRoot = app.getPath('appData');
+const userDataRoot = path.join(appDataRoot, 'openbrowser');
+app.setName('OpenBrowser');
+try { process.title = 'OpenBrowser'; } catch (_) { /* ignore */ }
+// Guard: root/sudo would isolate configs under /var/root and break CPU/memory UI sync.
+try {
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const euid = typeof process.geteuid === 'function' ? process.geteuid() : null;
+  if (uid === 0 || euid === 0) {
+    console.error('[OpenBrowser] refuse to run as root/sudo — userData would split from normal user profiles.');
+    app.exit(2);
+  }
+} catch (_) { /* ignore */ }
+app.setPath('userData', userDataRoot);
+
+// Single instance: a second launch (e.g. while the app sits in the tray) focuses the
+// running window instead of spawning a copy. This only limits the app shell — browser
+// environments are kernel processes spawned per profile and are not affected.
+const gotSingleInstanceLock = app.requestSingleInstanceLock();
+if (!gotSingleInstanceLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => showMainWindow());
+}
+
+const defaultProfileDataRoot = path.join(app.getPath('userData'), 'browser-profiles-v2');
+const localSettingsFile = path.join(app.getPath('userData'), 'openbrowser-local-settings.json');
+
+const UPDATE_REPOSITORY = 'sheying2013/OpenBrowser';
+const UPDATE_API_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`;
+const UPDATE_LATEST_HTML = `https://github.com/${UPDATE_REPOSITORY}/releases/latest`;
+const UPDATE_RELEASES_ATOM = `https://github.com/${UPDATE_REPOSITORY}/releases.atom`;
+const UPDATE_ASSETS = Object.freeze({
+  'darwin:x64': 'OpenBrowser-macOS-x86_64.dmg',
+  'darwin:arm64': 'OpenBrowser-macOS-arm64-with-kernel.dmg',
+  'win32:x64': 'OpenBrowser-Windows-x86_64-with-kernel.exe',
+  'linux:x64': 'OpenBrowser-Linux-x86_64-with-kernel.tar.gz',
+});
+const UPDATE_MAX_BYTES = 1024 * 1024 * 1024;
+const UPDATE_TIMEOUT_MS = 20000;
+const UPDATE_ALLOWED_HOSTS = new Set(['github.com', 'objects.githubusercontent.com', 'release-assets.githubusercontent.com']);
+
+function updatePlatformKey() {
+  return `${process.platform}:${process.arch}`;
+}
+
+function updateAssetName() {
+  return UPDATE_ASSETS[updatePlatformKey()] || null;
+}
+
+function updateUrlIsAllowed(value, assetName) {
+  try {
+    const url = new URL(String(value || ''));
+    if (url.protocol !== 'https:') return false;
+    const pathName = decodeURIComponent(url.pathname);
+    const endsWithAsset = pathName.endsWith('/' + assetName) || pathName.endsWith(assetName);
+    if (!endsWithAsset) return false;
+    return UPDATE_ALLOWED_HOSTS.has(url.hostname)
+      || (url.hostname === 'github.com' && pathName.includes('/releases/download/'));
+  } catch (_) {
+    return false;
+  }
+}
+
+function updateUserAgent() {
+  return `OpenBrowser/${app.getVersion()} (+https://github.com/${UPDATE_REPOSITORY})`;
+}
+
+function normalizeRemoteTag(value) {
+  return String(value || '').trim().replace(/^v/i, '');
+}
+
+function metaFromTag(tag, source, releaseUrl) {
+  const remoteVersion = normalizeRemoteTag(tag);
+  if (!remoteVersion) return null;
+  return {
+    remoteVersion,
+    releaseName: remoteVersion,
+    releaseUrl: releaseUrl || `https://github.com/${UPDATE_REPOSITORY}/releases/tag/v${remoteVersion}`,
+    source,
+  };
+}
+
+/**
+ * Resolve latest release tag without relying solely on GitHub API
+ * (unauthenticated REST hits rate limits → false "unknown/yellow" light).
+ * Priority: Atom feed → HTML follow/redirect → REST API.
+ */
+async function resolveLatestReleaseMeta() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
+  const htmlHeaders = { 'User-Agent': updateUserAgent(), Accept: 'text/html,application/xhtml+xml,*/*' };
+  try {
+    // 1) Atom feed — no API quota, works in Electron without redirect:manual quirks
+    try {
+      const response = await fetch(UPDATE_RELEASES_ATOM, {
+        headers: { 'User-Agent': updateUserAgent(), Accept: 'application/atom+xml,application/xml,text/xml,*/*' },
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        const atom = await response.text();
+        // Prefer entry-level ids/links (first entry is newest)
+        const entry = atom.match(/<entry\b[\s\S]*?<\/entry>/i)?.[0] || atom;
+        const fromAtom = entry.match(/\/releases\/tag\/([^<"'\s]+)/i)
+          || entry.match(/<id>tag:github\.com,\d+:Repository\/\d+\/([^<]+)<\/id>/i)
+          || atom.match(/\/releases\/tag\/([^<"'\s]+)/i);
+        const meta = fromAtom ? metaFromTag(decodeURIComponent(fromAtom[1]), 'atom') : null;
+        if (meta) return meta;
+      }
+    } catch (_) { /* try next */ }
+
+    // 2) /releases/latest — follow redirects; final URL or body contains /releases/tag/vX.Y.Z
+    //    (prefer follow over manual: Electron Chromium often hides Location on opaqueredirect)
+    try {
+      const response = await fetch(UPDATE_LATEST_HTML, {
+        method: 'GET',
+        redirect: 'follow',
+        headers: htmlHeaders,
+        signal: controller.signal,
+      });
+      const finalUrl = String(response.url || '');
+      const fromUrl = finalUrl.match(/\/releases\/tag\/([^/?#]+)/i);
+      if (fromUrl) {
+        const meta = metaFromTag(decodeURIComponent(fromUrl[1]), 'html-url', finalUrl);
+        if (meta) return meta;
+      }
+      if (response.ok) {
+        const html = await response.text();
+        const fromHtml = html.match(/\/releases\/tag\/(v?[\w.-]+)/i);
+        const meta = fromHtml ? metaFromTag(fromHtml[1], 'html') : null;
+        if (meta) return meta;
+      }
+    } catch (_) { /* try next */ }
+
+    // 2b) manual redirect Location (Node undici / some hosts)
+    try {
+      const response = await fetch(UPDATE_LATEST_HTML, {
+        method: 'GET',
+        redirect: 'manual',
+        headers: htmlHeaders,
+        signal: controller.signal,
+      });
+      const location = response.headers.get('location') || response.headers.get('Location') || '';
+      const fromLoc = location.match(/\/releases\/tag\/([^/?#]+)/i);
+      if (fromLoc) {
+        const abs = location.startsWith('http') ? location : `https://github.com${location}`;
+        const meta = metaFromTag(decodeURIComponent(fromLoc[1]), 'redirect', abs);
+        if (meta) return meta;
+      }
+    } catch (_) { /* try next */ }
+
+    // 3) REST API (last resort; unauthenticated often 403 rate-limit)
+    const response = await fetch(UPDATE_API_URL, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': updateUserAgent(),
+      },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`GitHub Releases request failed (${response.status})`);
+    const release = await response.json();
+    const tag = normalizeRemoteTag(release.tag_name || release.name || '');
+    if (!tag) throw new Error('GitHub Release has no version tag');
+    return {
+      remoteVersion: tag,
+      releaseName: String(release.name || release.tag_name || tag),
+      releaseUrl: String(release.html_url || `https://github.com/${UPDATE_REPOSITORY}/releases/tag/v${tag}`),
+      source: 'api',
+      apiRelease: release,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function resolveReleaseAsset(remoteVersion, assetName) {
+  if (!assetName || !remoteVersion) return null;
+  const directUrl = `https://github.com/${UPDATE_REPOSITORY}/releases/download/v${remoteVersion}/${assetName}`;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
+    try {
+      const response = await fetch(directUrl, {
+        method: 'HEAD',
+        redirect: 'follow',
+        headers: { 'User-Agent': updateUserAgent() },
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        return {
+          name: assetName,
+          size: Number(response.headers.get('content-length')) || 0,
+          browser_download_url: directUrl,
+        };
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (_) { /* optional */ }
+
+  // HEAD can be blocked or redirected differently by GitHub's edge. Resolve
+  // the exact tagged release through the API before declaring the asset absent.
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), UPDATE_TIMEOUT_MS);
+    try {
+      const apiUrl = `${UPDATE_API_URL.replace(/\/latest$/, '')}/tags/v${encodeURIComponent(remoteVersion)}`;
+      const response = await fetch(apiUrl, {
+        headers: { Accept: 'application/vnd.github+json', 'User-Agent': updateUserAgent() },
+        signal: controller.signal,
+      });
+      if (response.ok) {
+        const release = await response.json();
+        const asset = Array.isArray(release.assets)
+          ? release.assets.find((item) => item?.name === assetName)
+          : null;
+        if (asset?.browser_download_url && updateUrlIsAllowed(asset.browser_download_url, assetName)) {
+          return {
+            name: asset.name,
+            size: Number(asset.size) || 0,
+            browser_download_url: asset.browser_download_url,
+          };
+        }
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (_) { /* unavailable release metadata */ }
+  return null;
+}
+
+/** @deprecated use resolveLatestReleaseMeta — kept for download path compatibility */
+async function fetchUpdateRelease() {
+  const meta = await resolveLatestReleaseMeta();
+  if (meta.apiRelease) return meta.apiRelease;
+  return {
+    tag_name: `v${meta.remoteVersion}`,
+    name: meta.releaseName,
+    html_url: meta.releaseUrl,
+    assets: [],
+  };
+}
+
+/**
+ * Version traffic light only needs remote tag vs app.getVersion().
+ * Download package availability is optional (canDownload).
+ * green = up to date; red = remote is newer.
+ */
+async function checkAppUpdate() {
+  const assetName = updateAssetName();
+  const currentVersion = app.getVersion();
+  const meta = await resolveLatestReleaseMeta();
+  const remoteVersion = meta.remoteVersion;
+  if (!remoteVersion) throw new Error('GitHub Release has no version tag');
+  const upToDate = compareVersions(remoteVersion, currentVersion) <= 0;
+  let asset = null;
+  if (assetName) {
+    asset = await resolveReleaseAsset(remoteVersion, assetName);
+    // Prefer API asset URL if present
+    if (meta.apiRelease && Array.isArray(meta.apiRelease.assets)) {
+      const fromApi = meta.apiRelease.assets.find((item) => item?.name === assetName);
+      if (fromApi?.browser_download_url && updateUrlIsAllowed(fromApi.browser_download_url, assetName)) {
+        asset = { name: fromApi.name, size: Number(fromApi.size) || 0, browser_download_url: fromApi.browser_download_url };
+      }
+    }
+  }
+  return {
+    // supported = can show green/red for this build (always when we resolved a remote tag)
+    supported: true,
+    canDownload: Boolean(assetName && asset?.browser_download_url),
+    repository: UPDATE_REPOSITORY,
+    currentVersion,
+    remoteVersion,
+    upToDate,
+    releaseName: meta.releaseName || remoteVersion,
+    releaseUrl: meta.releaseUrl || `https://github.com/${UPDATE_REPOSITORY}/releases`,
+    platform: process.platform,
+    arch: process.arch,
+    source: meta.source || 'unknown',
+    asset: asset ? { name: asset.name, size: asset.size || 0, browser_download_url: asset.browser_download_url } : null,
+  };
+}
+
+async function downloadAppUpdate() {
+  const result = await checkAppUpdate();
+  if (!result.canDownload || !result.asset?.name) throw new Error('This platform has no published OpenBrowser installer package');
+  if (result.upToDate) return { success: false, upToDate: true, version: result.currentVersion, assetName: result.asset.name };
+  const downloadUrl = result.asset.browser_download_url
+    || `https://github.com/${UPDATE_REPOSITORY}/releases/download/v${result.remoteVersion}/${result.asset.name}`;
+  if (!updateUrlIsAllowed(downloadUrl, result.asset.name)) throw new Error('The selected update package URL is not trusted');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 120000);
+  const extension = path.extname(result.asset.name).toLowerCase();
+  const baseName = path.basename(result.asset.name, extension);
+  const temporaryPath = path.join(app.getPath('downloads'), `${baseName}-${randomUUID()}${extension}`);
+  let received = 0;
+  try {
+    const response = await fetch(downloadUrl, {
+      headers: { Accept: 'application/octet-stream', 'User-Agent': `OpenBrowser/${app.getVersion()}` },
+      signal: controller.signal,
+    });
+    if (!response.ok || !response.body) throw new Error(`Update download failed (${response.status})`);
+    const contentLength = Number(response.headers.get('content-length')) || 0;
+    if (contentLength > UPDATE_MAX_BYTES) throw new Error('Update package is too large');
+    await fsp.mkdir(path.dirname(temporaryPath), { recursive: true });
+    const file = await fsp.open(temporaryPath, 'w');
+    try {
+      const reader = response.body.getReader();
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        received += chunk.value.byteLength;
+        if (received > UPDATE_MAX_BYTES) throw new Error('Update package is too large');
+        await file.write(Buffer.from(chunk.value));
+        emit({ type: 'app-update-progress', received, total: contentLength || result.asset.size || 0, percent: contentLength ? Math.min(100, Math.round(received / contentLength * 100)) : null, version: result.remoteVersion });
+      }
+    } finally {
+      await file.close();
+    }
+    emit({ type: 'app-update-progress', received, total: contentLength || result.asset.size || received, percent: 100, version: result.remoteVersion });
+    const openError = await shell.openPath(temporaryPath);
+    if (openError) shell.showItemInFolder(temporaryPath);
+    return { success: true, path: temporaryPath, version: result.remoteVersion, assetName: result.asset.name };
+  } catch (error) {
+    await fsp.rm(temporaryPath, { force: true }).catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+/** Last GitHub Releases check; pushed to UI as traffic-light status. */
+let lastAppUpdateStatus = null;
+let appUpdateWatchTimer = null;
+const APP_UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
+const APP_UPDATE_STARTUP_DELAY_MS = 2500;
+const APP_UPDATE_CACHE_FILE = path.join(app.getPath('userData'), 'openbrowser-update-status.json');
+
+function appUpdateLightFromResult(result) {
+  // Product rule: green = latest, red = update available.
+  // Never use yellow for "I am latest". Failed checks without cache → gray "unknown".
+  if (!result) return 'unknown';
+  if (result.remoteVersion != null && result.currentVersion != null && result.upToDate != null) {
+    return result.upToDate ? 'green' : 'red';
+  }
+  return 'unknown';
+}
+
+async function loadCachedAppUpdateStatus() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(APP_UPDATE_CACHE_FILE, 'utf8'));
+    if (!raw || typeof raw !== 'object') return null;
+    if (raw.remoteVersion == null || raw.upToDate == null) return null;
+    // Cache only useful if it was for this same local version
+    if (raw.currentVersion && String(raw.currentVersion) !== String(app.getVersion())) return null;
+    lastAppUpdateStatus = {
+      supported: true,
+      canDownload: Boolean(raw.canDownload),
+      repository: UPDATE_REPOSITORY,
+      currentVersion: String(raw.currentVersion || app.getVersion()),
+      remoteVersion: String(raw.remoteVersion),
+      upToDate: Boolean(raw.upToDate),
+      releaseName: raw.releaseName || raw.remoteVersion,
+      releaseUrl: raw.releaseUrl || `https://github.com/${UPDATE_REPOSITORY}/releases`,
+      platform: process.platform,
+      arch: process.arch,
+      source: raw.source || 'cache',
+      asset: raw.asset || null,
+      cachedAt: raw.checkedAt || null,
+    };
+    return lastAppUpdateStatus;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function saveCachedAppUpdateStatus(result) {
+  if (!result || result.remoteVersion == null || result.upToDate == null) return;
+  try {
+    await fsp.mkdir(path.dirname(APP_UPDATE_CACHE_FILE), { recursive: true });
+    const payload = {
+      currentVersion: result.currentVersion,
+      remoteVersion: result.remoteVersion,
+      upToDate: result.upToDate,
+      canDownload: result.canDownload,
+      releaseName: result.releaseName,
+      releaseUrl: result.releaseUrl,
+      source: result.source,
+      asset: result.asset || null,
+      checkedAt: new Date().toISOString(),
+    };
+    const temporary = APP_UPDATE_CACHE_FILE + '.tmp';
+    await fsp.writeFile(temporary, JSON.stringify(payload, null, 2), 'utf8');
+    await fsp.rm(APP_UPDATE_CACHE_FILE, { force: true });
+    await fsp.rename(temporary, APP_UPDATE_CACHE_FILE);
+  } catch (_) { /* non-fatal */ }
+}
+
+/**
+ * Check GitHub latest release and push status to all windows (traffic light).
+ * green = up to date; red = newer release available; unknown = check failed (gray).
+ */
+async function pushAppUpdateStatus({ check = true } = {}) {
+  try {
+    const result = check ? await checkAppUpdate() : lastAppUpdateStatus;
+    if (!result) {
+      const cached = lastAppUpdateStatus;
+      if (cached?.remoteVersion != null && cached.upToDate != null) {
+        const payload = {
+          type: 'app-update-status',
+          light: cached.upToDate ? 'green' : 'red',
+          checkedAt: new Date().toISOString(),
+          ...cached,
+          stale: true,
+        };
+        emit(payload);
+        return payload;
+      }
+      const payload = {
+        type: 'app-update-status',
+        light: 'unknown',
+        currentVersion: app.getVersion(),
+        checkedAt: new Date().toISOString(),
+      };
+      emit(payload);
+      return payload;
+    }
+    lastAppUpdateStatus = { ...result, error: null };
+    await saveCachedAppUpdateStatus(lastAppUpdateStatus);
+    const payload = {
+      type: 'app-update-status',
+      light: appUpdateLightFromResult(result),
+      checkedAt: new Date().toISOString(),
+      ...result,
+    };
+    emit(payload);
+    return payload;
+  } catch (error) {
+    // Prefer last successful green/red over a confusing amber "error" light
+    if (lastAppUpdateStatus?.remoteVersion != null && lastAppUpdateStatus.upToDate != null) {
+      const payload = {
+        type: 'app-update-status',
+        light: lastAppUpdateStatus.upToDate ? 'green' : 'red',
+        checkedAt: new Date().toISOString(),
+        ...lastAppUpdateStatus,
+        stale: true,
+        warning: String(error && error.message || error),
+      };
+      emit(payload);
+      return payload;
+    }
+    const payload = {
+      type: 'app-update-status',
+      light: 'unknown',
+      currentVersion: app.getVersion(),
+      error: String(error && error.message || error),
+      checkedAt: new Date().toISOString(),
+    };
+    emit(payload);
+    return payload;
+  }
+}
+
+function startAppUpdateWatcher() {
+  // Paint cached green/red immediately so UI never sticks on yellow/checking
+  loadCachedAppUpdateStatus().then((cached) => {
+    if (cached) {
+      emit({
+        type: 'app-update-status',
+        light: appUpdateLightFromResult(cached),
+        checkedAt: new Date().toISOString(),
+        ...cached,
+        stale: true,
+      });
+    }
+  }).catch(() => {});
+
+  const run = () => {
+    pushAppUpdateStatus({ check: true }).catch((error) => {
+      console.warn('OpenBrowser update check failed:', error.message || error);
+    });
+  };
+  setTimeout(run, APP_UPDATE_STARTUP_DELAY_MS);
+  if (appUpdateWatchTimer) clearInterval(appUpdateWatchTimer);
+  appUpdateWatchTimer = setInterval(run, APP_UPDATE_POLL_MS);
+  if (typeof appUpdateWatchTimer.unref === 'function') appUpdateWatchTimer.unref();
+}
+
+function normalizeProfileDataRoot(value) {
+  const raw = String(value || '').trim();
+  const candidate = path.resolve(raw || defaultProfileDataRoot);
+  const check = validateDataRootIsolationSecure(candidate);
+  if (!check.ok) throw new Error(check.message);
+  return check.root;
+}
+
+const CLOSE_ACTION_VALUES = ['ask', 'tray', 'exit'];
+function normalizeCloseAction(value) {
+  return CLOSE_ACTION_VALUES.includes(value) ? value : 'ask';
+}
+
+let localSettingsCache = {
+  profileDataRoot: defaultProfileDataRoot,
+  cloud: cloudSync.defaultCloudConfig(),
+  uiGroups: [],
+  closeAction: 'ask',
+};
+
+async function loadLocalSettings() {
+  try {
+    const saved = JSON.parse(await fsp.readFile(localSettingsFile, 'utf8'));
+    localSettingsCache = {
+      profileDataRoot: normalizeProfileDataRoot(saved.profileDataRoot),
+      cloud: { ...cloudSync.defaultCloudConfig(), ...(saved.cloud || {}) },
+      uiGroups: Array.isArray(saved.uiGroups) ? saved.uiGroups : [],
+      closeAction: normalizeCloseAction(saved.closeAction),
+    };
+    return localSettingsCache;
+  } catch (_) {
+    localSettingsCache = {
+      profileDataRoot: defaultProfileDataRoot,
+      cloud: cloudSync.defaultCloudConfig(),
+      uiGroups: [],
+      closeAction: 'ask',
+    };
+    return localSettingsCache;
+  }
+}
+
+// Snapshot of what the file currently holds, so an unchanged cache does not
+// rewrite it. Cloned rather than referenced: later edits mutate nested objects.
+let persistedSettingsSnapshot = null;
+
+/** Write the settings file from the in-memory cache. */
+async function writeLocalSettingsFile() {
+  await fsp.mkdir(path.dirname(localSettingsFile), { recursive: true });
+  const temporary = localSettingsFile + '.tmp';
+  const serialized = JSON.stringify({ version: 2, ...localSettingsCache }, null, 2);
+  await fsp.writeFile(temporary, serialized, 'utf8');
+  await fsp.rm(localSettingsFile, { force: true });
+  await fsp.rename(temporary, localSettingsFile);
+  persistedSettingsSnapshot = JSON.parse(JSON.stringify(localSettingsCache));
+}
+
+// The cache holds the whole settings object, so a burst of changes only needs
+// the last one on disk. Going through one writer also stops concurrent callers
+// from racing on the same temporary file.
+const localSettingsWriter = createCoalescedWriter({
+  write: writeLocalSettingsFile,
+  // Saving the same settings twice is common (panel switches, repeated toggles)
+  // and the disk already holds that state, so skip the write entirely.
+  shouldWrite: () => persistedSettingsSnapshot === null
+    || !deepEqual(localSettingsCache, persistedSettingsSnapshot),
+  onError: (error) => console.warn('OpenBrowser settings write failed:', error.message),
+});
+
+async function saveLocalSettings(value) {
+  localSettingsCache = {
+    profileDataRoot: normalizeProfileDataRoot(value.profileDataRoot || localSettingsCache.profileDataRoot),
+    cloud: value.cloud || localSettingsCache.cloud || cloudSync.defaultCloudConfig(),
+    uiGroups: Array.isArray(value.uiGroups) ? value.uiGroups : (localSettingsCache.uiGroups || []),
+    closeAction: normalizeCloseAction(value.closeAction || localSettingsCache.closeAction),
+  };
+  return localSettingsWriter.request();
+}
+
+async function updateProfileDataRoot(value) {
+  if (!engine) throw new Error('Browser engine is not ready');
+  if (engine.running.size) throw new Error('\u8bf7\u5148\u505c\u6b62\u6240\u6709\u73af\u5883\uff0c\u518d\u4fee\u6539\u6570\u636e\u4fdd\u5b58\u4f4d\u7f6e');
+  const profileDataRoot = normalizeProfileDataRoot(value);
+  const secureCheck = await ensureDataRootIsolationSecure(profileDataRoot);
+  if (!secureCheck.ok) throw new Error(secureCheck.message);
+  engine.setProfileDataRoot(profileDataRoot);
+  await saveLocalSettings({ ...localSettingsCache, profileDataRoot });
+  emit({ type: 'storage-settings', profileRoot: profileDataRoot });
+  return { success: true, profileRoot: profileDataRoot, defaultProfileRoot: defaultProfileDataRoot };
+}
+
+function providerConfigFromCloud(cloud) {
+  const provider = String(cloud.provider || 'local').toLowerCase();
+  if (provider === 'webdav') return cloud.webdav || {};
+  if (provider === 'github') return cloud.github || {};
+  if (provider === 'gdrive' || provider === 'google' || provider === 'gcs') return cloud.gdrive || {};
+  if (provider === 'onedrive' || provider === 'microsoft' || provider === 'mscloud') return cloud.onedrive || cloud.webdav || {};
+  if (provider === 'quark' || provider === 'kuake') return cloud.quark || cloud.webdav || {};
+  if (provider === 'baidu' || provider === 'baiduyun' || provider === 'pan') return cloud.baidu || cloud.webdav || {};
+  if (cloudSync.isWebDavBridgeProvider?.(provider)) {
+    return cloud[provider] || cloud.webdav || {};
+  }
+  return cloud.local || {};
+}
+
+async function runCloudBackup(payload = {}) {
+  const cloud = { ...localSettingsCache.cloud, ...(payload.cloud || {}) };
+  const allProfiles = Array.isArray(payload.profiles)
+    ? payload.profiles
+    : [...(engine?.profiles?.values?.() || [])];
+  const profileIds = Array.isArray(payload.profileIds) ? payload.profileIds.map(String) : null;
+  const groups = Array.isArray(payload.groups) ? payload.groups : (localSettingsCache.uiGroups || []);
+  let proxies = [];
+  try { proxies = automation?.proxyStore?.list?.({}) || []; } catch (_) {}
+  const { buffer, meta } = await cloudSync.buildBackupPackage({
+    profiles: allProfiles,
+    groups,
+    proxies,
+    settings: { cloud: { ...cloud, passphrase: cloud.passphrase ? '***' : '' } },
+    profileDataRoot: engine?.getProfileDataRoot?.() || localSettingsCache.profileDataRoot,
+    includeBrowserData: cloud.includeBrowserData !== false,
+    passphrase: cloud.passphrase || '',
+    profileIds,
+  });
+  const remoteName = payload.remoteName || cloudSync.REMOTE_NAME;
+  const result = await cloudSync.upload(cloud.provider, providerConfigFromCloud(cloud), buffer, remoteName);
+  cloud.lastSyncAt = new Date().toISOString();
+  cloud.lastError = '';
+  await saveLocalSettings({ ...localSettingsCache, cloud });
+  emit({ type: 'cloud-sync', action: 'backup', ...meta, ...result });
+  return { success: true, meta, result, cloud };
+}
+
+async function applyBackupBody(body, { mode = 'merge', localProfiles = null, localGroups = null } = {}) {
+  const profileRoot = engine?.getProfileDataRoot?.() || localSettingsCache.profileDataRoot;
+  const remoteProfiles = (body.profiles || []).map((p) => {
+    const copy = { ...p };
+    return copy;
+  });
+  let restoredFiles = 0;
+  const dataById = new Map();
+  for (const profile of remoteProfiles) {
+    assertProfileId(profile?.id);
+    if (profile._dataFiles && profile.id) {
+      dataById.set(profile.id, profile._dataFiles);
+      delete profile._dataFiles;
+    }
+  }
+
+  const localList = Array.isArray(localProfiles)
+    ? localProfiles
+    : [...(engine?.profiles?.values?.() || [])];
+  const localGroupList = Array.isArray(localGroups) ? localGroups : (localSettingsCache.uiGroups || []);
+
+  const merged = cloudSync.mergeProfiles(localList, remoteProfiles, mode);
+  const groups = cloudSync.mergeGroups(localGroupList, body.groups || [], mode);
+
+  // restore browser data files for profiles that came from remote package
+  for (const profile of merged.profiles) {
+    const files = dataById.get(profile.id);
+    if (files) {
+      restoredFiles += await cloudSync.restoreProfileDataFiles(path.join(profileRoot, profile.id), files);
+    }
+  }
+
+  let proxies = body.proxies || [];
+  if (Array.isArray(proxies) && proxies.length) {
+    let localProxies = [];
+    try { localProxies = automation?.proxyStore?.list?.({}) || []; } catch (_) {}
+    proxies = cloudSync.mergeProxies(localProxies, proxies, mode);
+    if (automation?.proxyStore?.replaceAll) {
+      await automation.proxyStore.replaceAll(proxies).catch(() => {});
+    } else if (automation?.proxyStore) {
+      for (const item of proxies) {
+        try { await automation.proxyStore.create(item); } catch (_) {}
+      }
+    }
+  }
+
+  await saveLocalSettings({ ...localSettingsCache, uiGroups: groups });
+  if (engine) await engine.syncProfiles(merged.profiles);
+
+  return {
+    profiles: merged.profiles,
+    groups,
+    proxies,
+    restoredFiles,
+    mergeStats: merged.stats,
+    createdAt: body.createdAt,
+  };
+}
+
+async function runCloudRestore(payload = {}) {
+  const cloud = { ...localSettingsCache.cloud, ...(payload.cloud || {}) };
+  const mode = String(payload.mode || cloud.restoreMode || 'merge');
+  const remoteName = payload.remoteName || cloudSync.REMOTE_NAME;
+  const buffer = await cloudSync.download(cloud.provider, providerConfigFromCloud(cloud), remoteName);
+  const body = await cloudSync.parseBackupPackage(buffer, cloud.passphrase || payload.passphrase || '');
+
+  // optional: only restore subset of profile ids from the pack
+  if (Array.isArray(payload.profileIds) && payload.profileIds.length) {
+    const allow = new Set(payload.profileIds.map(String));
+    body.profiles = (body.profiles || []).filter((p) => allow.has(String(p.id)));
+  }
+
+  const applied = await applyBackupBody(body, {
+    mode,
+    localProfiles: payload.localProfiles,
+    localGroups: payload.localGroups,
+  });
+
+  cloud.lastSyncAt = new Date().toISOString();
+  cloud.lastError = '';
+  cloud.restoreMode = mode;
+  await saveLocalSettings({ ...localSettingsCache, cloud, uiGroups: applied.groups });
+  emit({
+    type: 'cloud-sync',
+    action: 'restore',
+    mode,
+    profileCount: applied.profiles.length,
+    restoredFiles: applied.restoredFiles,
+    mergeStats: applied.mergeStats,
+  });
+  return { success: true, mode, ...applied, cloud };
+}
+
+/** Push one or more environments as individual remote packs + refresh full pack optional */
+async function runCloudProfilePush(payload = {}) {
+  const cloud = { ...localSettingsCache.cloud, ...(payload.cloud || {}) };
+  const ids = sanitizeIds(payload.profileIds || (payload.profileId ? [payload.profileId] : []));
+  if (!ids.length) throw new Error('请指定要同步的环境');
+  const allProfiles = Array.isArray(payload.profiles)
+    ? payload.profiles
+    : [...(engine?.profiles?.values?.() || [])];
+  const results = [];
+  for (const id of ids) {
+    const profile = allProfiles.find((p) => p.id === id);
+    if (!profile) throw new Error('环境不存在：' + id);
+    const { buffer, meta } = await cloudSync.buildBackupPackage({
+      profiles: [{ ...profile, updatedAt: profile.updatedAt || new Date().toISOString() }],
+      groups: Array.isArray(payload.groups) ? payload.groups : (localSettingsCache.uiGroups || []),
+      proxies: [],
+      settings: { kind: 'profile', profileId: id },
+      profileDataRoot: engine?.getProfileDataRoot?.() || localSettingsCache.profileDataRoot,
+      includeBrowserData: cloud.includeBrowserData !== false,
+      passphrase: cloud.passphrase || '',
+      profileIds: [id],
+    });
+    const remoteName = cloudSync.profileRemoteName(id);
+    const result = await cloudSync.upload(cloud.provider, providerConfigFromCloud(cloud), buffer, remoteName);
+    results.push({ id, meta, result, remoteName });
+  }
+  cloud.lastSyncAt = new Date().toISOString();
+  cloud.lastError = '';
+  await saveLocalSettings({ ...localSettingsCache, cloud });
+  emit({ type: 'cloud-sync', action: 'profile-push', count: results.length, ids });
+  return { success: true, results, cloud };
+}
+
+async function runCloudProfilePull(payload = {}) {
+  const cloud = { ...localSettingsCache.cloud, ...(payload.cloud || {}) };
+  const mode = String(payload.mode || cloud.restoreMode || 'merge');
+  const ids = sanitizeIds(payload.profileIds || (payload.profileId ? [payload.profileId] : []));
+  if (!ids.length) throw new Error('请指定要拉取的环境');
+  const localProfiles = Array.isArray(payload.localProfiles)
+    ? payload.localProfiles
+    : [...(engine?.profiles?.values?.() || [])];
+  let combinedRemote = [];
+  let restoredFiles = 0;
+  const per = [];
+  for (const id of ids) {
+    const remoteName = cloudSync.profileRemoteName(id);
+    const buffer = await cloudSync.download(cloud.provider, providerConfigFromCloud(cloud), remoteName);
+    const body = await cloudSync.parseBackupPackage(buffer, cloud.passphrase || payload.passphrase || '');
+    combinedRemote = combinedRemote.concat(body.profiles || []);
+    per.push({ id, remoteName, count: (body.profiles || []).length, createdAt: body.createdAt });
+  }
+  const applied = await applyBackupBody(
+    { profiles: combinedRemote, groups: payload.groups || localSettingsCache.uiGroups || [], proxies: [] },
+    { mode, localProfiles, localGroups: payload.localGroups }
+  );
+  restoredFiles = applied.restoredFiles;
+  cloud.lastSyncAt = new Date().toISOString();
+  cloud.lastError = '';
+  await saveLocalSettings({ ...localSettingsCache, cloud, uiGroups: applied.groups });
+  emit({ type: 'cloud-sync', action: 'profile-pull', count: ids.length, mode, mergeStats: applied.mergeStats });
+  return { success: true, mode, ...applied, per, restoredFiles, cloud };
+}
+
+let engine;
+let liveSync;
+let automation = null;
+let quitting = false;
+let quitCleanupPromise = null;
+let syncSelection = [];
+let syncState = { active: false, master: null, selected: [] };
+const windows = new Set();
+let mainWindow = null;
+
+function trustedAppIndexUrl() {
+  // Canonical UI document: only this exact file:// path may call registerTrustedIpc.
+  // Reject other file:///…/index.html (e.g. /tmp/malicious/index.html) even if loaded in mainWindow.
+  return pathToFileURL(path.join(__dirname, 'index.html')).href;
+}
+
+/** Windows file: URLs may differ only by drive-letter case (C: vs c:). Compare paths case-insensitively. */
+function isTrustedAppIndexUrl(senderUrl) {
+  const expected = trustedAppIndexUrl();
+  const raw = String(senderUrl || '');
+  if (raw === expected || raw.startsWith(expected + '?') || raw.startsWith(expected + '#')) return true;
+  if (process.platform !== 'win32') return false;
+  const lower = raw.toLowerCase();
+  const expectedLower = expected.toLowerCase();
+  return lower === expectedLower || lower.startsWith(expectedLower + '?') || lower.startsWith(expectedLower + '#');
+}
+
+function assertTrustedIpcSender(event) {
+  if (!mainWindow || mainWindow.isDestroyed() || event?.sender !== mainWindow.webContents) {
+    throw new Error('untrusted IPC sender');
+  }
+  const senderUrl = String(event.sender.getURL?.() || '');
+  if (!isTrustedAppIndexUrl(senderUrl)) {
+    throw new Error('untrusted IPC document');
+  }
+}
+
+function registerTrustedIpc(channel, handler) {
+  ipcMain.handle(channel, (event, ...args) => {
+    assertTrustedIpcSender(event);
+    return handler(event, ...args);
+  });
+}
+let shortcutBridge = null;
+let shortcutFallbackRegistered = false;
+let shortcutActionInFlight = false;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function sanitizeIds(value) {
+  if (!Array.isArray(value) || value.length > 200) throw new Error('Invalid profile selection');
+  return [...new Set(value.map(assertProfileId))];
+}
+
+function emit(value) {
+  for (const win of windows) if (!win.isDestroyed()) win.webContents.send('engine:event', value);
+}
+
+function pickWorkArea() {
+  try {
+    const point = screen.getCursorScreenPoint?.();
+    if (point) return screen.getDisplayNearestPoint(point).workArea;
+  } catch (_) {}
+  return screen.getPrimaryDisplay().workArea;
+}
+
+let tray = null;
+const forceCloseWindowIds = new Set();
+
+function closeActionStrings() {
+  const zh = /^zh/i.test(String(app.getLocale?.() || ''));
+  if (zh) {
+    return {
+      message: '最小化到托盘，还是退出程序？',
+      minimize: '最小化到托盘',
+      quit: '退出程序',
+      remember: '记住我的选择',
+      trayShow: '显示主窗口',
+      trayQuit: '退出 OpenBrowser',
+      trayTooltip: 'OpenBrowser 正在后台运行，点击恢复主窗口',
+    };
+  }
+  return {
+    message: 'Minimize to tray, or quit?',
+    minimize: 'Minimize to tray',
+    quit: 'Quit',
+    remember: 'Remember my choice',
+    trayShow: 'Show OpenBrowser',
+    trayQuit: 'Quit OpenBrowser',
+    trayTooltip: 'OpenBrowser is running in the background — click to restore',
+  };
+}
+
+function trayIconImage() {
+  const pixelPng = path.join(__dirname, 'assets', 'logo-pixel.png');
+  const png = path.join(__dirname, 'assets', 'logo.png');
+  const ico = path.join(__dirname, 'assets', 'logo.ico');
+  const source = fs.existsSync(pixelPng) ? pixelPng : (fs.existsSync(png) ? png : ico);
+  let image = nativeImage.createFromPath(source);
+  if (process.platform === 'win32' && !image.isEmpty()) image = image.resize({ width: 16, height: 16 });
+  return image;
+}
+
+function ensureTray() {
+  if (tray || process.platform === 'darwin') return;
+  const strings = closeActionStrings();
+  tray = new Tray(trayIconImage());
+  tray.setToolTip(strings.trayTooltip);
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: strings.trayShow, click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: strings.trayQuit, click: () => app.quit() },
+  ]));
+  // Windows: left click restores the window, right click opens the menu.
+  tray.on('click', () => showMainWindow());
+}
+
+function destroyTray() {
+  try { tray?.destroy(); } catch (_) {}
+  tray = null;
+}
+
+function hideMainWindowToTray(win) {
+  ensureTray();
+  win.hide();
+}
+
+function showMainWindow() {
+  const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+  if (!win) {
+    createWindow().catch(() => {});
+    return;
+  }
+  if (win.isMinimized()) win.restore();
+  win.show();
+  win.focus();
+}
+
+async function askCloseAction(win) {
+  const strings = closeActionStrings();
+  const { response, checkboxChecked } = await dialog.showMessageBox(win, {
+    type: 'question',
+    buttons: [strings.minimize, strings.quit],
+    defaultId: 0,
+    cancelId: 1,
+    message: strings.message,
+    checkboxLabel: strings.remember,
+    checkboxChecked: false,
+    noLink: true,
+  });
+  return { mode: response === 0 ? 'tray' : 'exit', remember: Boolean(checkboxChecked) };
+}
+
+function clampBoundsToWorkArea(bounds, work) {
+  const norm = normalizeBounds(bounds);
+  const width = Math.max(320, Math.min(norm.width, work.width));
+  const height = Math.max(240, Math.min(norm.height, work.height));
+  const maxX = work.x + Math.max(0, work.width - width);
+  const maxY = work.y + Math.max(0, work.height - height);
+  const left = Math.max(work.x, Math.min(maxX, norm.left));
+  const top = Math.max(work.y, Math.min(maxY, norm.top));
+  return { left, top, width, height };
+}
+
+function normalizeBounds(bounds) {
+  return {
+    left: Math.round(Number(bounds.left) || 0),
+    top: Math.round(Number(bounds.top) || 0),
+    width: Math.max(320, Math.round(Number(bounds.width) || 800)),
+    height: Math.max(240, Math.round(Number(bounds.height) || 600)),
+  };
+}
+
+async function tile(ids, cascade = false) {
+  const entries = engine.runningWithCdp(sanitizeIds(ids));
+  if (!entries.length) throw new Error('No selected browser has a CDP session');
+  const work = pickWorkArea();
+  // Pause geometry mirroring while we rearrange so live-sync does not fight tile layout.
+  let cols = 1;
+  let rows = 1;
+  let overcrowded = false;
+  liveSync?.pauseGeometrySync?.(3500, cascade ? 'manual-cascade' : 'manual-tile');
+  if (liveSync) liveSync.lastWindowSync = Date.now();
+  if (cascade) {
+    // Cascade layout: left + vs * index
+    const { computeCascadeBounds } = require('./automation/protocol/window-sync-protocol');
+    const width = Math.max(760, work.width - 220);
+    const height = Math.max(560, work.height - 180);
+    const layout = computeCascadeBounds(entries.map((e) => e.id), {
+      left: work.x, top: work.y, width, height, vs: 38,
+      workWidth: work.width, workHeight: work.height,
+    });
+    await Promise.all(entries.map(({ item }, index) => {
+      const raw = layout[index]?.bounds || {
+        left: work.x + ((index * 38) % Math.max(1, work.width - width)),
+        top: work.y + ((index * 34) % Math.max(1, work.height - height)),
+        width,
+        height,
+      };
+      return cdp.setWindowBounds(item.port, clampBoundsToWorkArea(raw, work));
+    }));
+  } else {
+    // Choose the grid by fitting the work area, not by taking the square root
+    // of the count. A near-square grid can come out shorter than a window is
+    // allowed to be; the minimum size is then enforced anyway and the rows
+    // collapse into each other. The planner searches every column count and
+    // keeps the roomiest one that still satisfies both minimums, and reports
+    // when nothing does instead of silently building an overlapping layout.
+    const count = entries.length;
+    const grid = planGridFor({
+      totalWindows: count,
+      workArea: work,
+      // Match the floor the bounds clamp actually enforces, raised to the
+      // taller platform minimum where one exists.
+      minWidth: 320,
+      minHeight: Math.max(240, minHeightFor(process.platform)),
+    });
+    cols = grid.cols;
+    rows = grid.rows;
+    overcrowded = grid.overcrowded;
+    const baseWidth = Math.floor(work.width / cols);
+    const baseHeight = Math.floor(work.height / rows);
+    await Promise.all(entries.map(({ item }, index) => {
+      const col = index % cols;
+      const row = Math.floor(index / cols);
+      const isLastCol = col === cols - 1;
+      const isLastRow = row === rows - 1;
+      const width = isLastCol ? Math.max(320, work.width - col * baseWidth) : baseWidth;
+      const height = isLastRow ? Math.max(240, work.height - row * baseHeight) : baseHeight;
+      return cdp.setWindowBounds(item.port, clampBoundsToWorkArea({
+        left: work.x + col * baseWidth,
+        top: work.y + row * baseHeight,
+        width,
+        height,
+      }, work));
+    }));
+  }
+  liveSync?.pauseGeometrySync?.(5000, cascade ? 'manual-cascade-settle' : 'manual-tile-settle');
+  return {
+    success: true,
+    count: entries.length,
+    mode: cascade ? 'cascade' : 'tile',
+    platform: process.platform,
+    workArea: work,
+    // True when the selected layout cannot give every window its minimum
+    // size, so callers can warn instead of presenting an unusable result.
+    overcrowded: cascade ? undefined : overcrowded,
+  };
+}
+
+function isEnvironmentStartUrl(value) {
+  const s = String(value || '');
+  if (/openbrowser-start\.html/i.test(s)) return true;
+  if (/openbrowser-start|openbrowser-native/i.test(s)) return true;
+  if (/https?:\/\/127\.0\.0\.1:5032[6-9]\/?/i.test(s)) return true;
+  return Boolean(engine?.isStartPageUrl?.(s));
+}
+
+function environmentStartUrl(entry) {
+  // Prefer live start URL from running session (http://127.0.0.1:PORT/?id=...)
+  if (entry?.item?.startUrl) return entry.item.startUrl;
+  if (entry?.id && engine?.running?.get?.(entry.id)?.startUrl) {
+    return engine.running.get(entry.id).startUrl;
+  }
+  try {
+    const profile = entry?.item?.profile || engine?.profiles?.get?.(entry?.id);
+    if (profile && engine?.startPageServer) {
+      return engine.startPageServer.buildUrl(profile);
+    }
+  } catch (_) {}
+  const root = entry?.item?.root || entry?.root;
+  if (!root) return null;
+  // pathToFileURL percent-encodes spaces / CJK so Windows profiles under "C:\Users\Foo Bar\..." work.
+  return pathToFileURL(path.join(root, 'openbrowser-start.html')).href;
+}
+
+// --- Internal Browser Page Synchronization Rules (Issue #19) ---
+// Internal WebUI pages (chrome://, edge://) can be mirrored initially across browsers
+// via CDP navigation, but cannot participate in DOM live-sync due to Chromium security sandbox.
+const MAX_SYNC_TABS = 20;
+
+const {
+  BLOCKED_INTERNAL_SCHEMES,
+  BLOCKED_INTERNAL_HOSTS,
+  ALLOWED_INTERNAL_HOSTS,
+  ALLOWED_INTERNAL_PAGES,
+  isNavigableInternalUrl,
+  isDangerousOrBlockedInternalUrl,
+  createTabUrlPolicy,
+} = require('./automation/protocol/internal-pages');
+
+const { canMirrorTabUrl, canDomLiveSyncTabUrl } = createTabUrlPolicy({ isEnvironmentStartUrl });
+
+async function syncTabsFromMaster(ids) {
+  const entries = engine.runningWithCdp(sanitizeIds(ids));
+  if (entries.length < 2) throw new Error('Select at least two running browser environments');
+  const masterEntry = entries[0];
+  const slaveEntries = entries.slice(1);
+
+  // Filter master tabs: mirror normal web pages and navigable internal pages,
+  // excluding dangerous or malformed URLs. Cap at MAX_SYNC_TABS.
+  const masterTabs = (await cdp.tabs(masterEntry.item.port)).filter((tab) => canMirrorTabUrl(tab?.url));
+  const urls = masterTabs.map((tab) => tab.url).filter(Boolean).slice(0, MAX_SYNC_TABS);
+
+  const slaveSummaries = [];
+  for (const slave of slaveEntries) {
+    const summary = { id: slave.id, mirrored: 0, failed: 0, errors: [] };
+    try {
+      const existing = (await cdp.tabs(slave.item.port)).filter((tab) => canMirrorTabUrl(tab?.url));
+      for (let index = 0; index < urls.length; index += 1) {
+        const sourceUrl = urls[index];
+        const targetUrl = isEnvironmentStartUrl(sourceUrl) ? (environmentStartUrl(slave) || sourceUrl) : sourceUrl;
+        try {
+          if (existing[index]) {
+            await cdp.call(existing[index].webSocketDebuggerUrl, 'Page.navigate', { url: targetUrl })
+              .catch(() => cdp.navigate(slave.item.port, targetUrl));
+          } else {
+            await cdp.newTab(slave.item.port, targetUrl);
+          }
+          summary.mirrored += 1;
+        } catch (tabError) {
+          // Failure isolation: failure on an internal or invalid tab navigation
+          // must not block synchronization for subsequent normal pages.
+          summary.failed += 1;
+          summary.errors.push({ url: targetUrl, error: String(tabError?.message || tabError) });
+        }
+      }
+    } catch (slaveError) {
+      summary.errors.push({ url: null, error: String(slaveError?.message || slaveError) });
+    }
+    slaveSummaries.push(summary);
+  }
+
+  const liveSyncEligibleUrls = urls.filter(canDomLiveSyncTabUrl);
+  const internalMirrorOnlyUrls = urls.filter(isNavigableInternalUrl);
+
+  return {
+    success: true,
+    master: masterEntry.id,
+    slaves: slaveEntries.length,
+    tabCount: urls.length,
+    mirroredUrls: urls,
+    liveSyncEligibleCount: liveSyncEligibleUrls.length,
+    internalMirrorCount: internalMirrorOnlyUrls.length,
+    mirrorOnlyCount: internalMirrorOnlyUrls.length,
+    slaveSummaries,
+  };
+}
+
+function syncSnapshot() { return { ...syncState, selected: [...syncState.selected] }; }
+
+function handleLiveSyncEvent(value) {
+  emit(value);
+  if ((value.type === 'sync-disconnected' || (value.type === 'live-sync' && value.active === false)) && syncState.active) {
+    syncState = { active: false, master: null, selected: [...syncSelection] };
+    emit({ type: 'sync-state', ...syncSnapshot(), reason: value.type });
+  }
+}
+
+async function beginSync(ids = syncSelection) {
+  let selected = sanitizeIds(ids);
+  if (selected.length < 2) selected = engine.runningWithCdp([...engine.running.keys()]).map((entry) => entry.id);
+  if (selected.length < 2) throw new Error('\u8bf7\u81f3\u5c11\u9009\u62e9\u4e24\u4e2a\u8fd0\u884c\u4e2d\u7684\u6d4f\u89c8\u5668\u73af\u5883');
+  syncSelection = selected;
+  await tile(selected, false);
+  const tabs = await syncTabsFromMaster(selected);
+  await liveSync.start(selected);
+  syncState = { active: true, master: selected[0], selected };
+  emit({ type: 'sync-state', ...syncSnapshot() });
+  return { success: true, ...tabs, state: syncSnapshot() };
+}
+
+function endSync() {
+  liveSync?.stop();
+  syncState = { active: false, master: null, selected: [...syncSelection] };
+  emit({ type: 'sync-state', ...syncSnapshot() });
+  return { success: true, state: syncSnapshot() };
+}
+
+async function restartSync() {
+  endSync();
+  return beginSync(syncSelection);
+}
+
+async function runShortcut(action) {
+  if (shortcutActionInFlight) return;
+  shortcutActionInFlight = true;
+  emit({ type: 'shortcut-triggered', action });
+  try {
+    if (action === 'start') await beginSync(syncSelection);
+    else if (action === 'stop') endSync();
+    else await restartSync();
+  } catch (error) {
+    emit({ type: 'sync-error', action, message: error.message });
+  } finally { shortcutActionInFlight = false; }
+}
+
+function registerShortcutFallback() {
+  if (shortcutFallbackRegistered) return;
+  shortcutFallbackRegistered = true;
+  const mod = process.platform === 'darwin' ? 'Command' : 'Control';
+  const shortcuts = [
+    [`${mod}+Alt+A`, 'start'],
+    [`${mod}+Alt+S`, 'start'],
+    [`${mod}+Alt+D`, 'stop'],
+    [`${mod}+Alt+R`, 'restart'],
+  ];
+  // Keep Windows-style Control+Alt bindings available on macOS too.
+  if (process.platform === 'darwin') {
+    shortcuts.push(
+      ['Control+Alt+A', 'start'],
+      ['Control+Alt+S', 'start'],
+      ['Control+Alt+D', 'stop'],
+      ['Control+Alt+R', 'restart'],
+    );
+  }
+  const registered = shortcuts.map(([accelerator, action]) => ({
+    accelerator,
+    registered: globalShortcut.register(accelerator, () => runShortcut(action)),
+  }));
+  emit({ type: 'shortcut-status', mode: process.platform === 'darwin' ? 'macos-global' : 'host-fallback', registered });
+}
+
+function registerTextShortcuts() {
+  const mod = process.platform === 'darwin' ? 'Command' : 'Control';
+  const shortcuts = [
+    [`${mod}+Alt+F`, 'random-number'],
+    [process.platform === 'darwin' ? 'Command+Option+Q' : 'Control+Q', 'same-text'],
+    ['Shift+F1', 'specified-text'],
+  ];
+  if (process.platform === 'darwin') {
+    shortcuts.push(
+      ['Control+Alt+F', 'random-number'],
+      ['Control+Q', 'same-text'],
+    );
+  }
+  const registered = shortcuts.map(([accelerator, action]) => ({ accelerator, registered: globalShortcut.register(accelerator, () => emit({ type: 'text-shortcut', action })) }));
+  emit({ type: 'text-shortcut-status', registered });
+}
+
+function startShortcutBridge() {
+  const executable = path.join(__dirname, 'native-sync-hotkeys.exe');
+  if (process.platform !== 'win32' || !fs.existsSync(executable)) {
+    registerShortcutFallback();
+    return;
+  }
+  const child = spawn(executable, [], { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+  shortcutBridge = child;
+  let output = '';
+  child.stdout.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => {
+    output += chunk;
+    const lines = output.split(/\r?\n/); output = lines.pop() || '';
+    for (const line of lines.map((value) => value.trim()).filter(Boolean)) {
+      if (line === 'READY') emit({ type: 'shortcut-status', mode: 'windows-hook', active: true, accelerators: ['Ctrl+Alt+A', 'Ctrl+Alt+S', 'Ctrl+Alt+D', 'Ctrl+Alt+R'] });
+      else if (line === 'start' || line === 'stop' || line === 'restart') runShortcut(line);
+    }
+  });
+  let errorOutput = '';
+  child.stderr.setEncoding('utf8');
+  child.stderr.on('data', (chunk) => { errorOutput = (errorOutput + chunk).slice(-1000); });
+  child.once('error', (error) => {
+    if (shortcutBridge !== child) return;
+    shortcutBridge = null;
+    emit({ type: 'sync-error', action: 'shortcut-bridge', message: error.message });
+    if (!quitting) registerShortcutFallback();
+  });
+  child.once('exit', (code) => {
+    if (shortcutBridge !== child) return;
+    shortcutBridge = null;
+    if (!quitting) {
+      emit({ type: 'sync-error', action: 'shortcut-bridge', message: errorOutput.trim() || ('Windows shortcut bridge exited: ' + code) });
+      registerShortcutFallback();
+    }
+  });
+}
+
+function stopShortcutBridge() {
+  const child = shortcutBridge;
+  shortcutBridge = null;
+  if (child && !child.killed) { try { child.kill(); } catch (_) {} }
+  globalShortcut.unregisterAll();
+  shortcutFallbackRegistered = false;
+}
+async function fetchStorePackage(url, proxyValue = null) {
+  const initial = new URL(url);
+  if (initial.protocol !== 'https:' || initial.hostname !== 'clients2.google.com') throw new Error('Chrome 商店下载地址无效');
+  const controller = new AbortController(); const timer = setTimeout(() => controller.abort(), 180000);
+  try {
+    const storeSession = session.fromPartition('persist:openbrowser-extension-store');
+    if (proxyValue === 'system') await storeSession.setProxy({ mode: 'system' });
+    else if (proxyValue) await storeSession.setProxy({ mode: 'fixed_servers', proxyRules: proxyValue });
+    else await storeSession.setProxy({ mode: 'direct' });
+    const response = await storeSession.fetch(url, { redirect: 'follow', signal: controller.signal, headers: { 'user-agent': 'Mozilla/5.0 OpenBrowserLocal/3.0' } });
+    const finalUrl = new URL(String(response.url || url));
+    if (finalUrl.protocol !== 'https:' || !['clients2.google.com', 'clients2.googleusercontent.com'].includes(finalUrl.hostname)) throw new Error('Chrome 商店返回了不受信任的下载地址');
+    if (!response.ok) throw new Error('Chrome 商店下载失败（HTTP ' + response.status + '）');
+    const declared = Number(response.headers.get('content-length') || 0); if (declared > 120 * 1024 * 1024) throw new Error('扩展包超过 120 MB 限制');
+    const buffer = Buffer.from(await response.arrayBuffer()); if (buffer.length > 120 * 1024 * 1024) throw new Error('扩展包超过 120 MB 限制');
+    return buffer;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('连接 Chrome 应用商店超时，请检查系统代理/VPN，或先给任一目标环境配置可访问 Google 的代理');
+    throw error;
+  } finally { clearTimeout(timer); }
+}
+
+const chromeStoreIconRequests = new Map();
+
+function validChromeStoreId(value) {
+  return /^[a-p]{32}$/i.test(String(value || '')) ? String(value).toLowerCase() : null;
+}
+
+function chromeStoreImageUrl(html) {
+  const text = String(html || '');
+  const match = text.match(/<meta[^>]+(?:property|name)=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+    || text.match(/<meta[^>]+content=["']([^"']+)["'][^>]+(?:property|name)=["']og:image["']/i)
+    || text.match(/https:\/\/[a-z0-9.-]+\.googleusercontent\.com\/[^"'\\s>]+\.(?:png|jpe?g|webp)/i)
+    || text.match(/https:\/\/lh3\.googleusercontent\.com\/[^"'\\s>]+/i);
+  if (!match) return null;
+  return String(match[1] || match[0]).replace(/&amp;/g, '&');
+}
+
+function isChromeStoreIconHost(hostname) {
+  const host = String(hostname || '').toLowerCase();
+  return host === 'chromewebstore.google.com' || host.endsWith('.googleusercontent.com') || host.endsWith('.gstatic.com') || host.endsWith('.ggpht.com');
+}
+
+function bufferToDataUrl(buffer, contentType = '') {
+  const type = String(contentType || '').toLowerCase().split(';')[0].trim();
+  let mime = type.startsWith('image/') ? type : '';
+  if (!mime && buffer?.length >= 4) {
+    if (buffer[0] === 0x89 && buffer[1] === 0x50) mime = 'image/png';
+    else if (buffer[0] === 0xff && buffer[1] === 0xd8) mime = 'image/jpeg';
+    else if (buffer[0] === 0x52 && buffer[1] === 0x49) mime = 'image/webp';
+    else if (buffer[0] === 0x47 && buffer[1] === 0x49) mime = 'image/gif';
+    else mime = 'image/png';
+  }
+  return `data:${mime || 'image/png'};base64,${Buffer.from(buffer).toString('base64')}`;
+}
+
+async function cachedIconDataUrl(cacheFile) {
+  try {
+    const data = await fsp.readFile(cacheFile);
+    if (!data.length) return null;
+    return bufferToDataUrl(data);
+  } catch (_) {
+    return null;
+  }
+}
+
+function extensionIconSource(manifest) {
+  const sets = [manifest?.icons, manifest?.action?.default_icon, manifest?.browser_action?.default_icon, manifest?.page_action?.default_icon];
+  for (const set of sets) {
+    if (typeof set === 'string') return set;
+    if (!set || typeof set !== 'object') continue;
+    const entry = Object.entries(set).filter(([, value]) => typeof value === 'string')
+      .sort(([left], [right]) => Number(right) - Number(left))[0];
+    if (entry) return entry[1];
+  }
+  return null;
+}
+
+async function fetchChromeStoreMetadata(storeId) {
+  const safeId = validChromeStoreId(storeId);
+  if (!safeId) return null;
+  const cacheDir = path.join(app.getPath('userData'), 'app-center-icons');
+  const metadataFile = path.join(cacheDir, `${safeId}.json`);
+  const cacheFile = path.join(cacheDir, `${safeId}.img`);
+  try {
+    const cached = JSON.parse(await fsp.readFile(metadataFile, 'utf8'));
+    if (cached) {
+      // Prefer live data URL from cached image bytes (sandbox-safe in renderer)
+      const dataUrl = await cachedIconDataUrl(cacheFile);
+      if (dataUrl) return { ...cached, icon_url: dataUrl };
+      if (cached.icon_url && String(cached.icon_url).startsWith('data:')) return cached;
+      if (cached.description) {
+        // Try page icon scrape if only description was cached
+        const icon = await fetchChromeStoreIcon(safeId);
+        if (icon) {
+          const next = { ...cached, icon_url: icon };
+          await fsp.writeFile(metadataFile, JSON.stringify({ ...next, icon_url: 'file-cache' }), 'utf8').catch(() => {});
+          return next;
+        }
+      }
+      if (cached.icon_url || cached.description) return cached;
+    }
+  } catch (_) {}
+
+  let metadata = { name: '', description: '', icon_url: null };
+  try {
+    const query = new URLSearchParams({ response: 'redirect', prodversion: '150.0.0.0', acceptformat: 'crx2,crx3', x: `id=${safeId}&installsource=ondemand&uc` });
+    const buffer = await fetchStorePackage(`https://clients2.google.com/service/update2/crx?${query}`);
+    const { parseCrx, readManifest, readFile } = require('./automation/crx-reader');
+    const parsed = parseCrx(buffer);
+    // The signing key decides the extension id. A package whose signed id does
+    // not match the entry we asked for must not supply this entry's metadata.
+    if (parsed.extensionId && parsed.extensionId !== safeId) {
+      throw new Error(`CRX 签名 ID ${parsed.extensionId} 与商店 ID ${safeId} 不一致`);
+    }
+    // Read straight out of the package: no temp archive on disk, and no
+    // dependency on an external unpacker being installed.
+    const manifest = readManifest(parsed.zipBuffer);
+    metadata = {
+      name: typeof manifest.name === 'string' ? manifest.name : '',
+      description: typeof manifest.description === 'string' ? manifest.description : '',
+      icon_url: null,
+    };
+    const iconPath = extensionIconSource(manifest)?.replace(/^[/\\]+/, '');
+    if (iconPath && !iconPath.split('/').includes('..')) {
+      let image = null;
+      try { image = readFile(parsed.zipBuffer, iconPath); } catch (_) { image = null; }
+      if (image && image.length && image.length <= 2 * 1024 * 1024) {
+        await fsp.mkdir(cacheDir, { recursive: true });
+        await fsp.writeFile(cacheFile, image);
+        metadata.icon_url = bufferToDataUrl(image);
+      }
+    }
+  } catch (_) {
+    // CRX download often blocked; fall through to store page scrape
+  }
+
+  if (!metadata.icon_url) {
+    const icon = await fetchChromeStoreIcon(safeId);
+    if (icon) metadata.icon_url = icon;
+  }
+  if (metadata.icon_url || metadata.description) {
+    await fsp.mkdir(cacheDir, { recursive: true }).catch(() => {});
+    // Don't store huge data URLs in JSON — image is in .img cache
+    await fsp.writeFile(metadataFile, JSON.stringify({
+      name: metadata.name,
+      description: metadata.description,
+      icon_url: metadata.icon_url ? 'file-cache' : null,
+    }), 'utf8').catch(() => {});
+  }
+  return (metadata.icon_url || metadata.description) ? metadata : null;
+}
+
+async function fetchChromeStoreIcon(storeId) {
+  const safeId = validChromeStoreId(storeId);
+  if (!safeId) return null;
+  const cacheDir = path.join(app.getPath('userData'), 'app-center-icons');
+  const cacheFile = path.join(cacheDir, `${safeId}.img`);
+  const cached = await cachedIconDataUrl(cacheFile);
+  if (cached) return cached;
+  if (chromeStoreIconRequests.has(safeId)) return chromeStoreIconRequests.get(safeId);
+  const request = (async () => {
+    const storeSession = session.fromPartition('persist:openbrowser-extension-store');
+    const pageUrl = `https://chromewebstore.google.com/detail/${safeId}`;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 25000);
+    let response;
+    try {
+      response = await storeSession.fetch(pageUrl, {
+        redirect: 'follow',
+        signal: controller.signal,
+        headers: {
+          'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          'accept-language': 'en-US,en;q=0.9',
+        },
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!response.ok) return null;
+    const imageUrl = chromeStoreImageUrl(await response.text());
+    if (!imageUrl) return null;
+    const parsed = new URL(imageUrl);
+    if (parsed.protocol !== 'https:' || !isChromeStoreIconHost(parsed.hostname)) return null;
+    const imageController = new AbortController();
+    const imageTimeout = setTimeout(() => imageController.abort(), 20000);
+    let imageResponse;
+    try {
+      imageResponse = await storeSession.fetch(parsed.toString(), {
+        redirect: 'follow',
+        signal: imageController.signal,
+        headers: { 'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' },
+      });
+    } finally {
+      clearTimeout(imageTimeout);
+    }
+    const finalUrl = new URL(imageResponse.url || parsed.toString());
+    const contentType = String(imageResponse.headers.get('content-type') || '').toLowerCase();
+    if (!imageResponse.ok || !isChromeStoreIconHost(finalUrl.hostname)) return null;
+    // Some CDNs omit content-type; accept by magic bytes later
+    if (contentType && !contentType.startsWith('image/') && !contentType.includes('octet-stream')) return null;
+    const data = Buffer.from(await imageResponse.arrayBuffer());
+    if (!data.length || data.length > 2 * 1024 * 1024) return null;
+    await fsp.mkdir(cacheDir, { recursive: true });
+    await fsp.writeFile(cacheFile, data);
+    return bufferToDataUrl(data, contentType);
+  })().catch(() => null).finally(() => chromeStoreIconRequests.delete(safeId));
+  chromeStoreIconRequests.set(safeId, request);
+  return request;
+}
+
+/** Theme chrome colors for fused title bar (shipping-app look). */
+const THEME_CHROME = {
+  'oceanic-fingerprint': { bg: '#080e1e', overlay: '#0d172e', symbol: '#e2ebf8' },
+  'oceanic-fingerprint-light': { bg: '#eaf0ee', overlay: '#f3f7f6', symbol: '#233833' },
+  'merge-gateway': { bg: '#ffffff', overlay: '#ffffff', symbol: '#080808' },
+  'pixel-workstation': { bg: '#0c0f13', overlay: '#161c20', symbol: '#d1e5d4' },
+  'nes-light': { bg: '#c2b59c', overlay: '#d0c4aa', symbol: '#27231b' },
+  'element-admin': { bg: '#e8e8ed', overlay: '#f5f5f7', symbol: '#1d1d1f' },
+  'element-admin-dark': { bg: '#1c1c1e', overlay: '#2c2c2e', symbol: '#f5f5f7' },
+  'retro-desktop': { bg: '#d8d8d8', overlay: '#ececec', symbol: '#1c1c1c' },
+  default: { bg: '#0b1117', overlay: '#151f27', symbol: '#eef8f0' },
+};
+
+function chromeForTheme(themeId, colorMode) {
+  if (themeId === 'element-admin' && colorMode === 'dark') return THEME_CHROME['element-admin-dark'];
+  if (themeId === 'oceanic-fingerprint' && colorMode === 'light') return THEME_CHROME['oceanic-fingerprint-light'];
+  return THEME_CHROME[themeId] || THEME_CHROME.default;
+}
+
+function applyWindowChrome(win, themeId, colorMode) {
+  if (!win || win.isDestroyed()) return;
+  const chrome = chromeForTheme(themeId, colorMode);
+  // macOS: the System Native (element-admin) theme sits on a frosted-glass sidebar
+  // material. A transparent window backdrop lets that material show through the
+  // translucent sidebar/header; the opaque .content covers it so text stays readable.
+  // Every other theme turns vibrancy off and keeps its opaque background.
+  const macVibrant = process.platform === 'darwin' && themeId === 'element-admin';
+  // Windows 11: same idea via Mica — a system-tinted window backdrop that shows through
+  // the translucent sidebar/header. No-op / solid fallback on Win10 or Electron < 30.
+  const winMica = process.platform === 'win32' && themeId === 'element-admin';
+  try { win.setBackgroundColor((macVibrant || winMica) ? '#00000000' : chrome.bg); } catch (_) {}
+  if (process.platform === 'darwin' && typeof win.setVibrancy === 'function') {
+    try { win.setVibrancy(macVibrant ? 'sidebar' : null); } catch (_) {}
+  }
+  if (process.platform === 'win32' && typeof win.setBackgroundMaterial === 'function') {
+    try { win.setBackgroundMaterial(winMica ? 'mica' : 'none'); } catch (_) {}
+  }
+  // Keep Windows caption overlay in sync with theme (light/dark native skin too)
+  if (process.platform === 'win32' && typeof win.setTitleBarOverlay === 'function') {
+    try {
+      win.setTitleBarOverlay({
+        color: chrome.overlay,
+        symbolColor: chrome.symbol,
+        height: 40,
+      });
+    } catch (_) {}
+  }
+}
+
+async function createWindow() {
+  const isMac = process.platform === 'darwin';
+  const isWin = process.platform === 'win32';
+  const chrome = chromeForTheme('pixel-workstation');
+
+  /** @type {Record<string, any>} */
+  const options = {
+    width: 1280,
+    height: 860,
+    minWidth: 960,
+    minHeight: 680,
+    title: 'OpenBrowser',
+    icon: (() => {
+      // Window / taskbar: software pixel logo
+      const pixelPng = path.join(__dirname, 'assets', 'logo-pixel.png');
+      const icns = path.join(__dirname, 'assets', 'logo.icns');
+      const png = path.join(__dirname, 'assets', 'logo.png');
+      const ico = path.join(__dirname, 'assets', 'logo.ico');
+      if (isMac && fs.existsSync(icns)) return icns;
+      if (fs.existsSync(pixelPng)) return pixelPng;
+      if (fs.existsSync(png)) return png;
+      return ico;
+    })(),
+    backgroundColor: chrome.bg,
+    show: false,
+    autoHideMenuBar: true,
+    webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true, backgroundThrottling: true, spellcheck: false },
+  };
+
+  // Fuse system title bar with in-app chrome (shipping-app style)
+  if (isMac) {
+    options.titleBarStyle = 'hiddenInset';
+    // Sit in the empty strip above brand (brand is pushed down in CSS)
+    options.trafficLightPosition = { x: 12, y: 14 };
+    options.transparent = false;
+  } else if (isWin) {
+    // Same shipping-app fusion as macOS: custom chrome + native caption buttons
+    options.titleBarStyle = 'hidden';
+    options.frame = true;
+    options.titleBarOverlay = {
+      color: chrome.overlay,
+      symbolColor: chrome.symbol,
+      height: 40,
+    };
+  }
+
+  const win = new BrowserWindow(options);
+  mainWindow = win;
+  windows.add(win);
+  win.on('closed', () => { windows.delete(win); if (mainWindow === win) mainWindow = null; });
+  win.on('close', (event) => {
+    // macOS keeps the standard close-to-Dock convention; quitting paths bypass this.
+    if (quitting || process.platform === 'darwin') return;
+    if (forceCloseWindowIds.has(win.id)) { forceCloseWindowIds.delete(win.id); return; }
+    const pref = normalizeCloseAction(localSettingsCache.closeAction);
+    if (pref === 'exit') return;
+    event.preventDefault();
+    if (pref === 'tray') {
+      hideMainWindowToTray(win);
+      return;
+    }
+    askCloseAction(win)
+      .then(({ mode, remember }) => {
+        if (remember) {
+          localSettingsCache.closeAction = mode;
+          saveLocalSettings(localSettingsCache).catch(() => {});
+        }
+        if (win.isDestroyed()) return;
+        if (mode === 'tray') hideMainWindowToTray(win);
+        else { forceCloseWindowIds.add(win.id); win.close(); }
+      })
+      .catch(() => { try { if (!win.isDestroyed()) hideMainWindowToTray(win); } catch (_) {} });
+  });
+  win.once('ready-to-show', () => {
+    if (win.isDestroyed()) return;
+    win.show();
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  });
+  win.setMenu(null);
+  // The shell renders local files only: block navigation away from them and
+  // keep child windows denied (a child would inherit this window's preload).
+  attachShellNavigationGuard(win.webContents, {
+    onBlocked: ({ url, reason }) => console.warn('[shell] blocked navigation:', url, reason),
+  });
+  await win.loadFile('index.html');
+  if (!win.isVisible()) win.show();
+  if (win.isMinimized()) win.restore();
+  win.focus();
+}
+
+app.whenReady().then(async () => {
+  try { app.setName('OpenBrowser'); } catch (_) { /* ignore */ }
+  try { process.title = 'OpenBrowser'; } catch (_) { /* ignore */ }
+  if (process.platform === 'darwin' && app.dock) {
+    // Software Dock / shortcut icon = logo-pixel (not browser logo-native)
+    try {
+      const { rebuildAppShortcutIcons } = require('./automation/env-icon');
+      rebuildAppShortcutIcons();
+    } catch (error) {
+      console.warn('OpenBrowser app icons rebuild skipped:', error.message);
+    }
+    const dockCandidates = [
+      path.join(__dirname, 'assets', 'logo-pixel.png'),
+      path.join(__dirname, 'assets', 'logo.png'),
+      path.join(__dirname, 'assets', 'logo.icns'),
+    ];
+    for (const dockIcon of dockCandidates) {
+      try {
+        if (fs.existsSync(dockIcon)) {
+          app.dock.setIcon(dockIcon);
+          break;
+        }
+      } catch (error) {
+        console.warn('OpenBrowser Dock icon could not be applied:', error.message);
+      }
+    }
+  }
+  session.defaultSession.webRequest.onBeforeRequest((details, callback) => {
+    const url = String(details.url || '');
+    const allowed = url.startsWith('file:') || url.startsWith('data:') || url.startsWith('devtools:')
+      || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?\//i.test(url);
+    callback({ cancel: !allowed });
+  });
+  const localSettings = await loadLocalSettings();
+  const initialRootCheck = await ensureDataRootIsolationSecure(localSettings.profileDataRoot);
+  if (!initialRootCheck.ok) throw new Error(initialRootCheck.message);
+  engine = new BrowserEngine(app, { profileDataRoot: localSettings.profileDataRoot });
+  liveSync = new LiveSyncController(engine, handleLiveSyncEvent);
+  await engine.init(path.join(__dirname, 'bundled-extension'));
+  try {
+    const startPage = await engine.ensureStartPage();
+    startPage.setEngine?.(engine);
+    console.log('OpenBrowser start page:', startPage.info?.() || startPage.port);
+  } catch (error) {
+    console.error('OpenBrowser start page server failed:', error.message);
+  }
+  engine.on((value) => {
+    emit(value);
+    // Hub/ix style: when an opted-in profile closes, auto-push that env to cloud
+    if (value?.type === 'profile-closed' && value.cloudBackup && value.profile?.id) {
+      const cloud = localSettingsCache?.cloud || {};
+      if (cloud.enabled) {
+        runCloudProfilePush({
+          profileIds: [value.profile.id],
+          profiles: [value.profile],
+          groups: localSettingsCache.uiGroups || [],
+          cloud,
+        }).catch((error) => {
+          console.warn('OpenBrowser auto cloud push failed:', error.message);
+          emit({ type: 'cloud-sync', action: 'profile-push-error', id: value.profile.id, message: error.message });
+        });
+      }
+    }
+  });
+  engine.ensureKernelBootstrap().catch((error) => console.error('OpenBrowser kernel bootstrap failed:', error.message));
+  // Background: a kernel tree that no longer matches its install record is
+  // reported through kernel-progress instead of failing later without a cause.
+  engine.kernelIntegrityCheck?.().then((summary) => {
+    if (summary && summary.status === 'mismatch') console.warn('[kernel] integrity mismatch', summary);
+  }).catch((error) => console.warn('[kernel] integrity check skipped:', error.message));
+  startShortcutBridge();
+  registerTextShortcuts();
+
+  try {
+    automation = await startAutomation({
+      app,
+      engine,
+      liveSync,
+      beginSync,
+      endSync,
+      restartSync,
+      getSyncState: syncSnapshot,
+      setSelection: (ids) => {
+        syncSelection = sanitizeIds(ids);
+        syncState.selected = [...syncSelection];
+        emit({ type: 'sync-state', ...syncSnapshot() });
+      },
+      tile,
+      emit,
+      port: Number(process.env.OPENBROWSER_API_PORT || 50325),
+      apiKey: process.env.OPENBROWSER_API_KEY || undefined,
+    });
+  } catch (error) {
+    emit({ type: 'local-api-error', message: error.message });
+    console.error('Local API failed to start:', error.message);
+  }
+
+  registerTrustedIpc('system:info', () => ({
+    appVersion: app.getVersion(),
+    chrome: process.versions.chrome,
+    browsers: engine.candidates(),
+    profileRoot: engine.getProfileDataRoot(),
+    defaultProfileRoot: defaultProfileDataRoot,
+    localApi: automation?.info || null,
+    startPage: engine.startPageServer?.info?.() || null,
+    kernel: engine.kernelStatus(),
+    kernelSelection: engine.browserSelection(),
+    systemBrowsers: engine.systemBrowserCandidates().filter((item) => fs.existsSync(item.path)),
+    preferIndependentKernel: engine.preferIndependentKernel,
+    allowSystemBrowserFallback: engine.allowSystemBrowserFallback,
+    systemBrowserPath: engine.systemBrowserPath,
+    titleBarIntegrated: process.platform === 'darwin' || process.platform === 'win32',
+    platform: process.platform,
+    closeAction: normalizeCloseAction(localSettingsCache.closeAction),
+  }));
+  registerTrustedIpc('system:read-clipboard', () => {
+    try { return clipboard.readText(); } catch (_) { return ''; }
+  });
+  registerTrustedIpc('system:set-close-action', async (_event, mode) => {
+    const value = normalizeCloseAction(mode);
+    localSettingsCache.closeAction = value;
+    await saveLocalSettings(localSettingsCache);
+    // A remembered "exit" means the user no longer wants background running.
+    if (value === 'exit') destroyTray();
+    return { success: true, closeAction: value };
+  });
+  registerTrustedIpc('app:update-check', async () => {
+    const payload = await pushAppUpdateStatus({ check: true });
+    if (payload?.error && !payload?.remoteVersion) throw new Error(payload.error);
+    // Return check fields (without event envelope noise for renderer helpers)
+    const { type, light, checkedAt, error, ...rest } = payload || {};
+    if (error && !rest.supported) throw new Error(error);
+    return rest.currentVersion != null ? { ...rest, light, checkedAt } : await checkAppUpdate();
+  });
+  registerTrustedIpc('app:update-download', () => downloadAppUpdate());
+  registerTrustedIpc('app:open-github', async () => {
+    const url = `https://github.com/${UPDATE_REPOSITORY}`;
+    await shell.openExternal(url);
+    return { success: true, url };
+  });
+  registerTrustedIpc('system:set-ui-chrome', (_event, payload) => {
+    const win = BrowserWindow.fromWebContents(_event.sender) || mainWindow;
+    const themeId = typeof payload === 'string' ? payload : String(payload?.themeId || '');
+    const colorMode = typeof payload === 'object' && payload ? String(payload.colorMode || 'light') : 'light';
+    applyWindowChrome(win, themeId, colorMode);
+    return { success: true, theme: themeId, colorMode };
+  });
+  registerTrustedIpc('kernel:status', () => engine.kernelStatus());
+  registerTrustedIpc('kernel:download', async (_event, force) => engine.ensureIndependentKernel(Boolean(force)));
+  registerTrustedIpc('kernel:check-update', async () => engine.checkKernelUpdate());
+  registerTrustedIpc('kernel:set-custom', async (_event, binaryPath) => engine.setCustomKernel(String(binaryPath || '')));
+  registerTrustedIpc('kernel:policy', async (_event, policy) => engine.setKernelPolicy(policy || {}));
+  registerTrustedIpc('kernel:choose-custom', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择独立 Chromium / Chrome 可执行文件',
+      properties: ['openFile'],
+      filters: process.platform === 'win32'
+        ? [{ name: 'Executable', extensions: ['exe'] }]
+        : [{ name: 'All', extensions: ['*'] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    const kernel = await engine.setCustomKernel(result.filePaths[0]);
+    return { canceled: false, kernel };
+  });
+  registerTrustedIpc('system:get-storage', () => ({ profileRoot: engine.getProfileDataRoot(), defaultProfileRoot: defaultProfileDataRoot, running: engine.running.size }));
+  registerTrustedIpc('system:choose-storage', async () => {
+    if (engine.running.size) throw new Error('\u8bf7\u5148\u505c\u6b62\u6240\u6709\u73af\u5883\uff0c\u518d\u4fee\u6539\u6570\u636e\u4fdd\u5b58\u4f4d\u7f6e');
+    const options = { title: '\u9009\u62e9\u73af\u5883\u6570\u636e\u4fdd\u5b58\u76ee\u5f55', defaultPath: engine.getProfileDataRoot(), properties: ['openDirectory', 'createDirectory', 'promptToCreate'] };
+    const result = mainWindow && !mainWindow.isDestroyed() ? await dialog.showOpenDialog(mainWindow, options) : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return { canceled: true, profileRoot: engine.getProfileDataRoot(), defaultProfileRoot: defaultProfileDataRoot };
+    return { canceled: false, ...(await updateProfileDataRoot(result.filePaths[0])) };
+  });
+  registerTrustedIpc('system:reset-storage', () => updateProfileDataRoot(defaultProfileDataRoot));
+  registerTrustedIpc('system:open-storage', async () => {
+    const profileRoot = engine.getProfileDataRoot(); await fsp.mkdir(profileRoot, { recursive: true });
+    const message = await shell.openPath(profileRoot); if (message) throw new Error(message);
+    return { success: true, profileRoot };
+  });
+  registerTrustedIpc('cloud:get-config', async () => {
+    await loadLocalSettings();
+    return localSettingsCache.cloud || cloudSync.defaultCloudConfig();
+  });
+  registerTrustedIpc('cloud:set-config', async (_event, cloud) => {
+    await loadLocalSettings();
+    const next = { ...cloudSync.defaultCloudConfig(), ...(localSettingsCache.cloud || {}), ...(cloud || {}) };
+    await saveLocalSettings({ ...localSettingsCache, cloud: next });
+    return next;
+  });
+  registerTrustedIpc('cloud:choose-dir', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择云备份本地目录',
+      properties: ['openDirectory', 'createDirectory'],
+    });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    return { canceled: false, dir: result.filePaths[0] };
+  });
+  registerTrustedIpc('cloud:backup', async (_event, payload) => runCloudBackup(payload || {}));
+  registerTrustedIpc('cloud:restore', async (_event, payload) => runCloudRestore(payload || {}));
+  registerTrustedIpc('cloud:profile-push', async (_event, payload) => runCloudProfilePush(payload || {}));
+  registerTrustedIpc('cloud:profile-pull', async (_event, payload) => runCloudProfilePull(payload || {}));
+  registerTrustedIpc('cloud:export-file', async (_event, payload) => {
+    const cloud = { ...localSettingsCache.cloud, ...(payload?.cloud || {}) };
+    const profiles = Array.isArray(payload?.profiles) ? payload.profiles : [...(engine?.profiles?.values?.() || [])];
+    const groups = Array.isArray(payload?.groups) ? payload.groups : (localSettingsCache.uiGroups || []);
+    let proxies = [];
+    try { proxies = automation?.proxyStore?.list?.({}) || []; } catch (_) {}
+    const { buffer, meta } = await cloudSync.buildBackupPackage({
+      profiles,
+      groups,
+      proxies,
+      settings: {},
+      profileDataRoot: engine?.getProfileDataRoot?.() || localSettingsCache.profileDataRoot,
+      includeBrowserData: cloud.includeBrowserData !== false,
+      passphrase: cloud.passphrase || '',
+      profileIds: payload?.profileIds || null,
+    });
+    const result = await dialog.showSaveDialog({
+      title: '导出 OpenBrowser 备份',
+      defaultPath: `openbrowser-backup-${Date.now()}.obpack`,
+      filters: [{ name: 'OpenBrowser Backup', extensions: ['obpack'] }],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    await fsp.writeFile(result.filePath, buffer);
+    return { success: true, path: result.filePath, meta };
+  });
+  registerTrustedIpc('cloud:import-file', async (_event, payload) => {
+    const result = await dialog.showOpenDialog({
+      title: '导入 OpenBrowser 备份',
+      properties: ['openFile'],
+      filters: [{ name: 'OpenBrowser Backup', extensions: ['obpack', 'json', 'gz'] }],
+    });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    const buffer = await fsp.readFile(result.filePaths[0]);
+    const body = await cloudSync.parseBackupPackage(buffer, payload?.passphrase || localSettingsCache.cloud?.passphrase || '');
+    const mode = String(payload?.mode || localSettingsCache.cloud?.restoreMode || 'merge');
+    const applied = await applyBackupBody(body, {
+      mode,
+      localProfiles: payload?.localProfiles,
+      localGroups: payload?.localGroups,
+    });
+    return { success: true, mode, ...applied };
+  });
+  registerTrustedIpc('profiles:sync', (_event, profiles) => engine.syncProfiles(profiles));
+  registerTrustedIpc('profiles:delete', async (_event, payload) => {
+    const ids = sanitizeIds(payload?.ids || []);
+    if (syncState.active && syncState.selected.some((id) => ids.includes(id))) endSync();
+    syncSelection = syncSelection.filter((id) => !ids.includes(id));
+    syncState = { ...syncState, selected: syncState.selected.filter((id) => !ids.includes(id)) };
+    emit({ type: 'sync-state', ...syncSnapshot() });
+    return engine.deleteProfiles(ids, payload?.deleteData !== false);
+  });
+  registerTrustedIpc('profiles:start', (_event, profile) => engine.start(profile));
+  registerTrustedIpc('profiles:stop', (_event, id) => engine.stop(id));
+  registerTrustedIpc('profiles:clear-cache-cookies', (_event, id) => engine.clearProfileCacheAndCookies(id));
+  registerTrustedIpc('profiles:status', () => engine.status());
+  registerTrustedIpc('profiles:test-proxy', (_event, profile) => engine.testProxy(profile));
+  registerTrustedIpc('profiles:check-proxy', (_event, profile) => engine.checkProxy(profile, { persist: true }));
+
+  registerTrustedIpc('extensions:list', () => engine.listExtensions());
+  registerTrustedIpc('extensions:add-folder', async () => {
+    const result = await dialog.showOpenDialog({ title: '选择已解压的 Chrome 扩展目录', properties: ['openDirectory'] });
+    if (result.canceled || !result.filePaths[0]) return { canceled: true };
+    const extension = await engine.addExtension(result.filePaths[0]);
+    const ids = [...engine.profiles.keys()]; const running = ids.filter((id) => engine.running.has(id));
+    if (ids.length) await engine.assignExtension(extension.id, ids, true);
+    for (const id of running) await engine.stop(id);
+    for (const id of running) { const profile = engine.profiles.get(id); if (profile) await engine.start(profile); }
+    return { canceled: false, extension, assigned: ids.length, restarted: running.length };
+  });
+  registerTrustedIpc('extensions:add-store', async (_event, payload) => {
+    const ids = sanitizeIds(payload.profileIds || []);
+    const storeUrl = String(payload.url || ''); let extension;
+    try { extension = await engine.addStoreExtension(storeUrl); }
+    catch (directError) {
+      try { extension = await engine.addStoreExtension(storeUrl, (url) => fetchStorePackage(url, 'system')); }
+      catch (systemError) { throw new Error(`Chrome 应用商店下载失败。直连：${directError.message}；系统代理：${systemError.message}`); }
+    }
+    const running = new Set(engine.status().filter((item) => item.running && ids.includes(item.id)).map((item) => item.id));
+    if (ids.length) await engine.assignExtension(extension.id, ids, true);
+    if (payload.restart) {
+      for (const id of running) await engine.stop(id);
+      for (const id of running) { const profile = engine.profiles.get(id); if (profile) await engine.start(profile); }
+    }
+    return { extension, assigned: ids.length, restarted: payload.restart ? running.size : 0 };
+  });
+  registerTrustedIpc('extensions:assign', (_event, payload) => engine.assignExtension(String(payload.extensionId), sanitizeIds(payload.profileIds), Boolean(payload.enabled)));
+  registerTrustedIpc('extensions:toggle-all', async (_event, payload) => {
+    const extensionId = String(payload.extensionId || ''); const enabled = Boolean(payload.enabled);
+    const ids = [...engine.profiles.keys()]; const running = ids.filter((id) => engine.running.has(id));
+    await engine.assignExtension(extensionId, ids, enabled);
+    for (const id of running) await engine.stop(id);
+    for (const id of running) { const profile = engine.profiles.get(id); if (profile) await engine.start(profile); }
+    return { success: true, enabled, affected: ids.length, restarted: running.length };
+  });
+  registerTrustedIpc('extensions:reload', async (_event, id) => {
+    if (!id || id === 'all') return await engine.reloadAllExtensions();
+    return await engine.reloadExtension(String(id));
+  });
+  registerTrustedIpc('extensions:remove', (_event, id) => engine.removeExtension(String(id)));
+
+  registerTrustedIpc('sync:sessions', () => engine.sessions());
+  registerTrustedIpc('sync:selection', (_event, ids) => { syncSelection = sanitizeIds(ids); syncState.selected = [...syncSelection]; emit({ type: 'sync-state', ...syncSnapshot() }); return syncSnapshot(); });
+  registerTrustedIpc('sync:state', () => syncSnapshot());
+  registerTrustedIpc('sync:settings:get', () => liveSync.getSettings());
+  registerTrustedIpc('sync:settings:set', (_event, value) => liveSync.updateSettings(value));
+  registerTrustedIpc('sync:start', (_event, ids) => beginSync(ids));
+  registerTrustedIpc('sync:stop', () => endSync());
+  registerTrustedIpc('sync:restart', () => restartSync());
+  registerTrustedIpc('sync:window', async (_event, payload) => {
+    const ids = sanitizeIds(payload.ids); const entries = engine.runningWithCdp(ids); const action = String(payload.action);
+    if (action === 'tile') return tile(ids, false);
+    if (action === 'cascade') return tile(ids, true);
+    if (!['minimized', 'normal', 'maximized', 'fullscreen'].includes(action)) throw new Error('Unknown window action');
+    const transitions = await Promise.all(entries.map(({ item }) => cdp.setWindowState(item.port, action, action === 'fullscreen'
+      ? { verify: true, fallbackState: 'maximized' }
+      : {})));
+    return { success: true, count: entries.length, degraded: transitions.filter((value) => value?.degraded).length };
+  });
+  registerTrustedIpc('sync:text', async (_event, payload) => {
+    const ids = sanitizeIds(payload.ids); const action = String(payload.action); const text = String(payload.text || '').slice(0, 100000);
+    const entries = new Map(engine.runningWithCdp(ids).map((entry) => [entry.id, entry]));
+    const min = Math.max(0, Math.min(5, Number(payload.delayMin) || 0)); const max = Math.max(min, Math.min(5, Number(payload.delayMax) || min));
+    const profiles = []; const failures = [];
+    for (const id of ids) {
+      const entry = entries.get(id);
+      if (!entry) { failures.push({ id, message: 'Environment is not running or has no CDP session' }); continue; }
+      try {
+        let result;
+        if (action === 'clear') result = await cdp.clearFocused(entry.item.port); else {
+          const delay = min + Math.random() * (max - min); if (delay) await sleep(delay * 1000);
+          result = await cdp.insertText(entry.item.port, text);
+        }
+        profiles.push({ id, targetId: result.targetId, textLength: text.length });
+      } catch (error) { failures.push({ id, message: error.message }); }
+    }
+    return { success: failures.length === 0 && profiles.length === ids.length, profiles, failures };
+  });
+  registerTrustedIpc('sync:text-batch', async (_event, payload) => {
+    const ids = sanitizeIds(payload.ids);
+    const texts = Array.isArray(payload.texts) ? payload.texts.map((value) => String(value || '').slice(0, 100000)) : [];
+    if (!ids.length || texts.length !== ids.length) throw new Error('Text assignments must match the selected environments');
+    const assignments = new Map(ids.map((id, index) => [id, texts[index]]));
+    const entries = new Map(engine.runningWithCdp(ids).map((entry) => [entry.id, entry]));
+    const min = Math.max(0, Math.min(5, Number(payload.delayMin) || 0)); const max = Math.max(min, Math.min(5, Number(payload.delayMax) || min));
+    const profiles = []; const failures = [];
+    for (const id of ids) {
+      const entry = entries.get(id); const assignedText = assignments.get(id) || '';
+      if (!entry) { failures.push({ id, message: 'Environment is not running or has no CDP session' }); continue; }
+      try {
+        const delay = min + Math.random() * (max - min); if (delay) await sleep(delay * 1000);
+        const result = await cdp.insertText(entry.item.port, assignedText);
+        profiles.push({ id, targetId: result.targetId, textLength: assignedText.length });
+      } catch (error) { failures.push({ id, message: error.message }); }
+    }
+    return { success: failures.length === 0 && profiles.length === ids.length, profiles, failures };
+  });
+  registerTrustedIpc('sync:tabs', async (_event, payload) => {
+    const ids = sanitizeIds(payload.ids); const entries = engine.runningWithCdp(ids); const action = String(payload.action); const value = payload.payload || {};
+    if (action === 'sync') return syncTabsFromMaster(ids);
+    if (action === 'list') return engine.sessions();
+    for (const { item } of entries) {
+      if (action === 'new') await cdp.newTab(item.port, String(value.url || 'about:blank'));
+      else if (action === 'navigate') await cdp.navigate(item.port, String(value.url || 'about:blank'));
+      else if (action === 'reload') await cdp.reload(item.port);
+      else if (action === 'close') { const tab = await cdp.firstTab(item.port); if (tab) await cdp.closeTab(item.port, tab.id); }
+      else throw new Error('Unknown tab action');
+    }
+    return { success: true, count: entries.length };
+  });
+
+  registerTrustedIpc('automation:local-api', () => automation?.info || null);
+  registerTrustedIpc('automation:local-api-version', async () => {
+    if (!automation?.localApi) throw new Error('Local API is not ready');
+    return automation.localApi.route('GET', '/api/getVersion', {});
+  });
+  registerTrustedIpc('automation:fingerprint', (_event, id) => engine.fingerprintFor(String(id || '')));
+  registerTrustedIpc('automation:isolation-audit', () => engine.isolationAudit());
+  registerTrustedIpc('automation:build-ua', (_event, payload = {}) => {
+    const { buildUaProfile, randomUaForSeed, parseOsFromUa } = require('./automation/user-agent');
+    const crypto = require('crypto');
+    if (payload?.random) {
+      const seed = crypto.randomBytes(4).readUInt32BE(0);
+      return randomUaForSeed(seed, {
+        majors: payload.chromeMajor ? [Number(payload.chromeMajor)] : undefined,
+        osList: payload.os ? [payload.os] : undefined,
+      });
+    }
+    const osMap = { Windows: 'windows', windows: 'windows', macOS: 'macos', macos: 'macos', Mac: 'macos', Linux: 'linux', linux: 'linux', Android: 'android', android: 'android' };
+    const os = osMap[payload.os] || payload.os || parseOsFromUa(payload.userAgent || '') || undefined;
+    if (os === 'android') {
+      const { mobilePersona } = require('./automation/mobile-personas');
+      const deviceSeed = payload.deviceSeed !== undefined
+        ? Number(payload.deviceSeed)
+        : crypto.randomBytes(4).readUInt32BE(0);
+      return mobilePersona(deviceSeed, 'android', {
+        chromeMajor: Number(payload.chromeMajor) || undefined,
+      }).uaProfile;
+    }
+    return buildUaProfile({
+      userAgent: payload.userAgent || '',
+      os,
+      chromeMajor: Number(payload.chromeMajor) || undefined,
+      chromeFull: payload.chromeFull || payload.fullVersion,
+      reduced: payload.reduced !== false,
+    });
+  });
+
+  const proxyStore = () => {
+    if (!automation?.proxyStore) throw new Error('代理库未就绪');
+    return automation.proxyStore;
+  };
+  registerTrustedIpc('proxy:list', (_event, filter) => proxyStore().list(filter || {}));
+  registerTrustedIpc('proxy:get', (_event, id) => proxyStore().get(String(id || '')));
+  registerTrustedIpc('proxy:create', (_event, payload) => proxyStore().create(payload || {}));
+  registerTrustedIpc('proxy:update', (_event, payload) => {
+    const id = String(payload?.id || payload?.proxy_id || '');
+    if (!id) throw new Error('id required');
+    return proxyStore().update(id, payload || {});
+  });
+  registerTrustedIpc('proxy:delete', (_event, ids) => proxyStore().remove(ids));
+  registerTrustedIpc('proxy:check', async (_event, payload) => {
+    const store = proxyStore();
+    const id = String(payload?.id || payload?.proxy_id || '');
+    const item = id ? store.get(id) : null;
+    const raw = item?.raw || payload?.proxy || payload?.raw;
+    if (!raw) throw new Error('proxy required');
+    try {
+      const result = await engine.testProxy({
+        id: 'proxy-check',
+        name: 'proxy-check',
+        proxy: raw,
+        proxyMeta: {
+          ipChannel: item?.ipChannel || payload?.ipChannel || 'ip-api',
+          apiExtractUrl: item?.refreshUrl || payload?.apiExtractUrl || '',
+          refreshUrl: item?.refreshUrl || payload?.refreshUrl || '',
+        },
+      });
+      if (item) await store.markCheck(item.id, result);
+      return { ...result, proxy: item ? store.get(item.id) : null };
+    } catch (error) {
+      if (item) {
+        await store.markCheckError(item.id, {
+          errorClass: error.errorClass || 'unknown',
+          latencyMs: error.latencyMs,
+        });
+      }
+      throw error;
+    }
+  });
+  registerTrustedIpc('proxy:check-many', async (_event, payload) => {
+    const store = proxyStore();
+    const ids = Array.isArray(payload?.ids) ? payload.ids.map(String) : [];
+    if (!ids.length) throw new Error('ids required');
+    const results = [];
+    for (const id of ids.slice(0, 100)) {
+      const item = store.get(id);
+      if (!item) {
+        results.push({ id, ok: false, error: 'not found' });
+        continue;
+      }
+      try {
+        const result = await engine.testProxy({
+          id: 'proxy-check',
+          name: item.name || 'proxy-check',
+          proxy: item.raw,
+          proxyMeta: { ipChannel: item.ipChannel || 'ip-api', refreshUrl: item.refreshUrl || '', apiExtractUrl: item.refreshUrl || '' },
+        });
+        await store.markCheck(item.id, result);
+        results.push({ id, ok: true, ...result, proxy: store.get(item.id) });
+      } catch (error) {
+        await store.markCheckError(item.id, {
+          errorClass: error.errorClass || 'unknown',
+          latencyMs: error.latencyMs,
+        });
+        results.push({
+          id,
+          ok: false,
+          error: error.message || String(error),
+          errorClass: error.errorClass || 'unknown',
+          latencyMs: error.latencyMs || null,
+          proxy: store.get(item.id),
+        });
+      }
+    }
+    return { results, ok: results.filter((r) => r.ok).length, fail: results.filter((r) => !r.ok).length };
+  });
+  registerTrustedIpc('profiles:refresh-proxy', (_event, profile) => engine.refreshProfileProxy(profile));
+  registerTrustedIpc('profiles:apply-proxy-fingerprint', async (_event, profile) => {
+    const network = await engine.checkProxy(profile, { persist: true });
+    return network;
+  });
+  registerTrustedIpc('automation:app-center', (_event, filter) => {
+    if (!automation?.appCenter) return { list: { builtin: [], recommended: [], local: [] }, counts: { builtin: 0, recommended: 0, local: 0, installed: 0 } };
+    return automation.appCenter.list(filter || {});
+  });
+  registerTrustedIpc('automation:app-center-icons', async (_event, storeIds) => {
+    const ids = [...new Set((Array.isArray(storeIds) ? storeIds : []).map(validChromeStoreId).filter(Boolean))];
+    // Bounded fan-out: the panel may ask for dozens of entries at once.
+    return fetchStoreEntries(ids, (id) => fetchChromeStoreIcon(id));
+  });
+  registerTrustedIpc('automation:app-center-metadata', async (_event, storeIds) => {
+    const ids = [...new Set((Array.isArray(storeIds) ? storeIds : []).map(validChromeStoreId).filter(Boolean))];
+    return fetchStoreEntries(ids, (id) => fetchChromeStoreMetadata(id));
+  });
+  registerTrustedIpc('automation:rpa-status', () => automation?.rpaEngine?.getStatus?.() || { running: [], count: 0 });
+  registerTrustedIpc('automation:rpa-plans', () => automation?.rpaStore?.listPlans?.() || []);
+  registerTrustedIpc('automation:rpa-tasks', (_event, filter) => automation?.rpaStore?.listTasks?.(filter || {}) || []);
+  registerTrustedIpc('automation:rpa-get-plan', (_event, id) => automation?.rpaStore?.getPlan?.(String(id || '')) || null);
+  registerTrustedIpc('automation:rpa-save-plan', (_event, plan) => {
+    if (!automation) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.upsertPlan(plan);
+  });
+  registerTrustedIpc('automation:rpa-delete-plan', (_event, id) => {
+    if (!automation) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.deletePlan(String(id || ''));
+  });
+  registerTrustedIpc('automation:rpa-run', async (_event, payload) => {
+    if (!automation) throw new Error('Automation stack is not ready');
+    if (payload?.plan_id) return automation.rpaEngine.runPlan(String(payload.plan_id), payload);
+    if (payload?.task_id) return automation.rpaEngine.runTask(String(payload.task_id), payload);
+    if (Array.isArray(payload?.steps)) {
+      const task = await automation.rpaStore.createTask({
+        profile_id: String(payload.profile_id || ''),
+        process_name: String(payload.name || 'ipc-rpa'),
+        steps: payload.steps,
+      });
+      return automation.rpaEngine.runTask(task.id, payload);
+    }
+    throw new Error('plan_id, task_id or steps required');
+  });
+  registerTrustedIpc('automation:rpa-stop', (_event, taskId) => automation?.rpaEngine?.stop?.(taskId || null));
+  registerTrustedIpc('automation:rpa-templates', (_event, filter) => {
+    if (!automation?.rpaStore) return { list: [], categories: ['全部'], config: {} };
+    return {
+      list: automation.rpaStore.listTemplates(filter || {}),
+      categories: automation.rpaStore.listTemplateCategories(),
+      config: automation.rpaStore.getConfig?.() || {},
+    };
+  });
+  registerTrustedIpc('automation:rpa-template-get', (_event, id) => automation?.rpaStore?.getTemplate?.(String(id || '')) || null);
+  registerTrustedIpc('automation:rpa-template-save', (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.upsertTemplate(payload || {});
+  });
+  registerTrustedIpc('automation:rpa-template-save-as', (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.saveAsTemplate(payload || {});
+  });
+  registerTrustedIpc('automation:rpa-template-delete', (_event, id) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.deleteTemplate(String(id || ''));
+  });
+  registerTrustedIpc('automation:rpa-template-install', (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    const id = String(payload?.id || payload?.template_id || '');
+    if (!id) throw new Error('template id required');
+    return automation.rpaStore.installTemplate(id, payload || {});
+  });
+  registerTrustedIpc('automation:rpa-template-sync-remote', async (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    // Remote sync is opt-in only: caller must pass base explicitly (no hard-coded host).
+    if (payload?.token || payload?.cookie || payload?.apiKey || payload?.base) {
+      await automation.rpaStore.setConfig({
+        remoteToken: payload.token || undefined,
+        remoteCookie: payload.cookie || undefined,
+        remoteApiKey: payload.apiKey || undefined,
+        remoteApiBase: payload.base || undefined,
+        remoteApiOrigin: payload.origin || undefined,
+        remoteLang: payload.lang || 'zh-CN',
+      });
+    }
+    return automation.rpaStore.syncRemoteTemplates(payload || {});
+  });
+  registerTrustedIpc('automation:rpa-template-config', async (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    if (payload && typeof payload === 'object' && Object.keys(payload).length) {
+      return automation.rpaStore.setConfig(payload);
+    }
+    return automation.rpaStore.getConfig();
+  });
+  registerTrustedIpc('automation:rpa-template-import-remote', async (_event, payload) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    return automation.rpaStore.importRemoteTemplatePayload(payload || {});
+  });
+  registerTrustedIpc('automation:rpa-template-export', async (_event, id) => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    const bundle = id
+      ? automation.rpaStore.exportTemplate(String(id))
+      : automation.rpaStore.exportAllCustomTemplates();
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showSaveDialog(mainWindow, {
+          title: '导出自动脚本模版',
+          defaultPath: `openbrowser-rpa-template-${Date.now()}.json`,
+          filters: [{ name: 'JSON', extensions: ['json'] }],
+        })
+      : await dialog.showSaveDialog({
+          title: '导出自动脚本模版',
+          defaultPath: `openbrowser-rpa-template-${Date.now()}.json`,
+          filters: [{ name: 'JSON', extensions: ['json'] }],
+        });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    await fsp.writeFile(result.filePath, JSON.stringify(bundle, null, 2), 'utf8');
+    return { success: true, path: result.filePath, count: bundle.templates?.length || 0 };
+  });
+  registerTrustedIpc('automation:rpa-template-import', async () => {
+    if (!automation?.rpaStore) throw new Error('Automation stack is not ready');
+    const result = mainWindow && !mainWindow.isDestroyed()
+      ? await dialog.showOpenDialog(mainWindow, {
+          title: '导入自动脚本模版 JSON',
+          properties: ['openFile'],
+          filters: [{ name: 'JSON', extensions: ['json'] }],
+        })
+      : await dialog.showOpenDialog({
+          title: '导入自动脚本模版 JSON',
+          properties: ['openFile'],
+          filters: [{ name: 'JSON', extensions: ['json'] }],
+        });
+    if (result.canceled || !result.filePaths?.[0]) return { canceled: true };
+    const raw = await fsp.readFile(result.filePaths[0], 'utf8');
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (error) {
+      throw new Error('JSON 解析失败：' + error.message);
+    }
+    return automation.rpaStore.importTemplates(parsed);
+  });
+  registerTrustedIpc('automation:api-key-rotate', async () => {
+    if (!automation) throw new Error('Automation stack is not ready');
+    const newKey = await automation.rotateApiKey();
+    automation.apiKey = newKey;
+    return { apiKey: newKey };
+  });
+  registerTrustedIpc('automation:rpa-task-delete', async (_event, ids) => {
+    if (!automation) throw new Error('Automation stack is not ready');
+    const list = [...new Set((Array.isArray(ids) ? ids : [ids]).map((id) => String(id || '').trim()).filter(Boolean))];
+    const running = new Set(automation.rpaEngine?.getStatus?.().running || []);
+    const deleted = []; const skipped = [];
+    for (const id of list) {
+      if (running.has(id)) { skipped.push(id); continue; }
+      const result = await automation.rpaStore.deleteTask(id);
+      if (result && result.deleted) deleted.push(id);
+      else skipped.push(id);
+    }
+    return { deleted, skipped };
+  });
+  registerTrustedIpc('automation:mcp-paths', () => ({
+    mcpScript: path.join(__dirname, 'automation', 'mcp-server.js'),
+    appRoot: __dirname,
+    port: automation?.info?.port || Number(process.env.OPENBROWSER_API_PORT || 50325),
+    apiKey: automation?.apiKey || process.env.OPENBROWSER_API_KEY || '',
+    apiKeyFile: automation?.apiKeyFile || path.join(app.getPath('userData'), 'local-api-key.txt'),
+    localApi: automation?.info || null,
+  }));
+
+  await createWindow();
+  startAppUpdateWatcher();
+});
+
+async function stopAllForQuit() {
+  if (!engine) return { stopped: true, remaining: [], errors: [] };
+  const lifecycleIds = () => [...new Set([
+    ...(engine.running?.keys?.() || []),
+    ...(engine.starting?.keys?.() || []),
+    ...(engine.stopping?.keys?.() || []),
+  ])];
+  let result = null;
+  const errors = [];
+  try { result = await engine.stopAll(); } catch (error) {
+    errors.push(String(error?.message || error));
+  }
+  let remaining = Array.isArray(result?.remaining) ? result.remaining : [];
+  if (!result) remaining = lifecycleIds();
+  if (Array.isArray(result?.errors)) errors.push(...result.errors);
+  for (let attempt = 0; attempt < 2 && remaining.length; attempt += 1) {
+    await Promise.allSettled(remaining.map((id) => engine.stop(id)));
+    await sleep(150 * (attempt + 1));
+    try { result = await engine.stopAll(); } catch (error) {
+      errors.push(String(error?.message || error));
+      result = null;
+    }
+    remaining = Array.isArray(result?.remaining) ? result.remaining : lifecycleIds();
+    if (Array.isArray(result?.errors)) errors.push(...result.errors);
+  }
+  if (remaining.length) {
+    console.warn('OpenBrowser quit left browser environments running, force-terminating:', remaining.join(', '));
+    for (const id of remaining) {
+      const item = engine.running?.get(id) || engine.starting?.get(id) || engine.stopping?.get(id);
+      if (item?.pid) {
+        try {
+          if (process.platform === 'win32') {
+            require('child_process').execFileSync('taskkill.exe', ['/PID', String(item.pid), '/T', '/F'], { windowsHide: true, timeout: 3000 });
+          } else {
+            process.kill(item.pid, 'SIGKILL');
+          }
+        } catch (_) {}
+      }
+      if (item?.root) {
+        isolation.terminateProcessesUsingProfile?.(item.root, { force: true }).catch(() => {});
+      }
+    }
+  }
+  return { ...(result || {}), stopped: remaining.length === 0, remaining, errors: [...new Set(errors)] };
+}
+
+function beginQuitCleanup() {
+  if (quitCleanupPromise) return quitCleanupPromise;
+  quitting = true;
+  destroyTray();
+  const cloud = localSettingsCache?.cloud || {};
+  let stopResult = { stopped: true, remaining: [], errors: [] };
+  quitCleanupPromise = Promise.resolve()
+    .then(async () => { stopResult = await stopAllForQuit(); })
+    .then(() => engine?.flushPersistence?.())
+    // A settings change made moments before quitting may still be inside the
+    // quiet period; write it out before the process goes away.
+    .then(() => localSettingsWriter.flushNow())
+    .then(() => {
+      try { liveSync?.stop?.(); } catch (error) {
+        console.warn('OpenBrowser quit live-sync cleanup failed:', error?.message || error);
+      }
+    })
+    .then(async () => {
+      try { await automation?.stop?.(); } catch (error) {
+        console.warn('OpenBrowser quit automation cleanup failed:', error?.message || error);
+      }
+    })
+    .then(async () => {
+      // Stop browsers and flush close-time state before packaging browser data.
+      // Otherwise the backup can capture stale cookies or locked SQLite/LevelDB files.
+      if (stopResult.remaining.length) return;
+      if (!cloud.enabled || !cloud.autoSyncOnQuit) return;
+      try {
+        await runCloudBackup({
+          profiles: [...(engine?.profiles?.values?.() || [])],
+          groups: localSettingsCache.uiGroups || [],
+          cloud,
+        });
+      } catch (error) {
+        console.warn('OpenBrowser quit auto-backup failed:', error.message);
+        try {
+          localSettingsCache.cloud = { ...cloud, lastError: error.message };
+          await saveLocalSettings(localSettingsCache);
+        } catch (_) {}
+      }
+    })
+    .finally(() => app.quit());
+  return quitCleanupPromise;
+}
+
+// A renderer or helper process that dies takes its page down with it, and the
+// report is the only durable record of which page and which reason. It lands in
+// the same diagnosis log as startup failures so one file tells the whole story.
+// Neither handler may throw: they run while the runtime is already handling a
+// failure, and a diagnosis path that itself fails would hide the original fault.
+function recordCrash(record) {
+  try {
+    writeBrowserStartupDiagnostic(app.getPath('userData'), record).catch(() => {});
+  } catch (_) {
+    /* diagnosis must never break the runtime */
+  }
+}
+
+app.on('render-process-gone', createCrashHandler({
+  log: (line, report) => recordCrash({ type: 'renderer-crash', line, report }),
+}));
+
+app.on('child-process-gone', (event, details) => {
+  try {
+    const report = buildHelperProcessGoneReport({
+      details,
+      processInfo: process,
+      appInfo: { version: app.getVersion() },
+    });
+    recordCrash({ type: 'helper-crash', line: 'helper-process-gone ' + JSON.stringify(report), report });
+  } catch (_) {
+    /* diagnosis must never break the runtime */
+  }
+});
+
+app.on('before-quit', (event) => {
+  if (quitting) return;
+  event.preventDefault();
+  beginQuitCleanup();
+});
+app.on('will-quit', () => {
+  stopShortcutBridge();
+  // before-quit owns the awaited shutdown chain. Do not invoke automation.stop()
+  // a second time while local API/RPA/proxy resources are already being closed.
+  if (!quitCleanupPromise) automation?.stop?.().catch(() => {});
+});
+app.on('window-all-closed', () => {
+  // OpenBrowser owns external browser processes. Closing its last control
+  // window must run the same awaited shutdown path on every platform so proxy
+  // exits cannot remain active behind a hidden macOS application.
+  if (!quitting) app.quit();
+});
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    isNavigableInternalUrl,
+    isDangerousOrBlockedInternalUrl,
+    canMirrorTabUrl,
+    canDomLiveSyncTabUrl,
+    BLOCKED_INTERNAL_SCHEMES,
+    BLOCKED_INTERNAL_HOSTS,
+    ALLOWED_INTERNAL_HOSTS,
+    ALLOWED_INTERNAL_PAGES,
+    MAX_SYNC_TABS,
+    syncTabsFromMaster,
+  };
+}

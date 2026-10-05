@@ -1,0 +1,29 @@
+# Dependencies
+node_modules
+node_modules/
+
+# Python bytecode and cache
+__pycache__
+__pycache__/
+*.pyc
+
+# Test reports and build output
+Browserapp/reports/
+/reports/
+dist
+dist/
+
+# OS generated files
+.DS_Store
+
+# Internal maintenance documentation (confidential - never commit)
+CODE_OVERVIEW.md
+**/CODE_OVERVIEW.md
+
+# Downloaded browser kernel (large binary runtime asset)
+Browserapp/kernels/chrome-stable/
+
+# Local runtime secrets
+**/.secret
+**/console-password.txt
+**/local-api-key.txt

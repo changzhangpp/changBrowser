@@ -1,0 +1,1725 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>OpenBrowser Web 控制台</title>
+<style>
+:root{
+  --bg:#0e1626; --bg2:#16203a; --panel:#182338; --panel2:#1f2c49; --line:#27334f;
+  --fg:#e9eefb; --muted:#8fa0c2; --acc:#2f6bff; --acc2:#5b8cff;
+  --ok:#35c46f; --warn:#e0b45f; --err:#e06c5f; --radius:14px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased;overflow:hidden}
+button{font:inherit;cursor:pointer;min-height:38px;border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--fg);padding:6px 16px}
+button.primary{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600}
+button.danger{background:transparent;border-color:transparent;color:var(--err)}
+button.ghost{background:transparent}
+button:disabled{opacity:.45;cursor:not-allowed}
+input,select{font:inherit;background:#0d1526;border:1px solid var(--line);border-radius:10px;color:var(--fg);padding:8px 12px;width:100%;min-height:40px}
+label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+/* 顶栏 */
+header{display:flex;align-items:center;gap:10px;padding:10px 16px;background:var(--bg2);border-bottom:1px solid var(--line)}
+header h1{font-size:17px;font-weight:700;margin-right:8px;white-space:nowrap}
+nav.top{display:flex;gap:8px;flex-wrap:nowrap;overflow-x:auto}
+nav.top button{border:none;background:transparent;color:var(--muted);min-height:34px;padding:5px 15px}
+nav.top button.active{background:var(--acc);color:#fff}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--muted);display:inline-block}
+.dot.ok{background:var(--ok)} .dot.bad{background:var(--err)}
+.badge{font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+header .right{margin-left:auto;display:flex;gap:14px;align-items:center}
+/* 布局 */
+.wrap{display:flex;height:calc(100vh - 55px);position:relative}
+#side-float{position:absolute;left:8px;top:8px;z-index:29;display:inline-flex;align-items:center;min-height:28px;padding:3px 12px;font-size:12.5px;border-radius:0 999px 999px 0;box-shadow:3px 0 10px rgba(0,0,0,.35)}
+.wrap:has(aside:not(.collapsed)) #side-float{display:none}
+aside{width:300px;min-width:300px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;transition:margin .2s}
+aside.collapsed{margin-left:-300px}
+.side-head{display:flex;justify-content:flex-end;padding:8px}
+.side-tools{padding:4px 12px 10px;border-bottom:1px solid var(--line)}
+.side-tools .row{display:flex;gap:8px;margin-bottom:8px}
+.side-tools .row>*{flex:1;min-width:0}
+.list-title{padding:10px 14px 4px;font-size:13px;color:var(--muted)}
+.plist{flex:1;overflow-y:auto;padding:8px 12px 20px;display:flex;flex-direction:column;gap:8px}
+.pcard{background:var(--panel2);border:1px solid var(--line);border-radius:var(--radius);padding:12px}
+.pcard.active{border-color:var(--acc)}
+.pcard.selected{border-color:var(--acc);box-shadow:0 0 0 1px var(--acc),0 0 14px rgba(47,107,255,.35);background:#1b2947}
+.pcard .t{display:flex;gap:8px;align-items:center;font-weight:600}
+.pcard .t .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcard .m{color:var(--muted);font-size:12px;margin:3px 0 9px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pcard .acts{display:flex;gap:6px;flex-wrap:wrap}
+.pcard .acts button{min-height:32px;padding:4px 13px;font-size:13px}
+.tag{font-size:11px;padding:1px 9px;border-radius:999px;background:#0d1526;color:var(--muted);border:1px solid var(--line)}
+.tag.on{color:var(--ok);border-color:var(--ok)}
+/* 主区 */
+main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;background:#0b1220}
+.view{flex:1;display:flex;flex-direction:column;min-height:0;padding:14px}
+.view.hidden{display:none}
+/* 浏览器查看器 */
+.viewer{flex:1;display:flex;flex-direction:column;min-height:0;background:#0b1220}
+.tabsbar{display:flex;align-items:flex-end;gap:4px;padding:4px 8px 0;overflow-x:auto;flex-shrink:0}
+.tab{display:flex;align-items:center;gap:8px;max-width:200px;padding:7px 12px;border:1px solid var(--line);border-bottom:none;border-radius:10px 10px 0 0;background:var(--panel);color:var(--muted);cursor:pointer;white-space:nowrap;font-size:13px}
+.tab.active{background:var(--bg2);color:var(--fg);border-color:var(--acc)}
+.tab .tt{overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.tab .x{color:var(--muted);padding:0 2px}
+.tab .x:hover{color:var(--err)}
+.tab-add{width:34px;height:34px;border-radius:10px 10px 0 0}
+.navbar{display:flex;gap:8px;padding:8px 10px;background:var(--bg2);border-top:1px solid var(--line);border-bottom:1px solid var(--line);flex-shrink:0}
+.navbar .icon{width:40px;min-width:40px;padding:0;text-align:center;font-size:15px}
+.navbar input{flex:1;min-height:38px}
+.viewport{flex:1;position:relative;overflow:hidden;background:#05080f;display:flex;align-items:center;justify-content:center;min-height:0}
+.viewport img{max-width:100%;max-height:100%;display:block;user-select:none;-webkit-user-drag:none;cursor:default}
+.hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:14px;text-align:center;padding:20px;background:#05080f}
+.state-badge{position:absolute;top:10px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:6px 18px;border-radius:10px;color:var(--muted);z-index:5}
+.reload-flash{position:absolute;top:10px;right:10px;background:var(--panel2);border:1px solid var(--accent,#4a9eff);color:var(--fg,#e8eef7);padding:5px 12px;border-radius:10px;font-size:12px;z-index:6;opacity:0;transition:opacity .4s;pointer-events:none}
+.reload-flash.show{opacity:1}
+/* 代理库 / 日志 */
+.toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+.toolbar h2{font-size:17px;margin-right:auto}
+.table{width:100%;border-collapse:collapse;font-size:13px}
+.table th,.table td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}
+.table th{color:var(--muted);font-weight:500}
+.seg{display:flex;gap:6px}
+.seg button{min-height:32px;padding:4px 14px;font-size:13px}
+.seg button.active{background:var(--acc);border-color:var(--acc);color:#fff}
+.event{border-left:3px solid var(--warn);padding:8px 12px;margin-bottom:8px;background:var(--panel);border-radius:0 10px 10px 0;font-size:13px}
+.event.danger{border-color:var(--err)}
+/* 弹窗 */
+.overlay{position:fixed;inset:0;background:rgba(4,8,18,.72);z-index:50;display:flex;align-items:center;justify-content:center;padding:16px}
+.overlay.hidden{display:none}
+.dialog{background:var(--bg2);border:1px solid var(--line);border-radius:16px;padding:22px;width:min(460px,94vw);max-height:88vh;overflow-y:auto}
+.dialog h3{margin-bottom:4px}
+.dialog .muted{color:var(--muted);font-size:12px;margin-bottom:10px}
+.dialog .row2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
+.dialog .btns{display:flex;gap:10px;margin-top:18px}
+.dialog .btns button{flex:1}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:9px 18px;border-radius:12px;z-index:99;max-width:90vw;display:none}
+.toast.show{display:block}
+.alert{background:#2a1f26;border:1px solid #5a3540;color:#f0b9b2;padding:9px 13px;border-radius:10px;margin:8px 0;display:none;font-size:13px}
+.alert.show{display:block}
+.spinner{display:inline-block;width:13px;height:13px;border:2px solid var(--muted);border-top-color:var(--fg);border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.muted{color:var(--muted)}
+.hidden{display:none!important}
+/* 移动端 */
+.toggle-side{display:none}
+.m-only{display:none!important}
+.vtools{display:flex;gap:6px;padding:6px 8px;background:var(--bg2);border-top:1px solid var(--line);flex-shrink:0;align-items:center;overflow-x:auto}
+.vtools button{min-height:32px;padding:4px 9px;font-size:12px;white-space:nowrap;flex:0 0 auto}
+.vtools select{width:auto;min-width:70px;min-height:32px;padding:4px 8px;font-size:12.5px;flex:0 0 auto}
+.vdot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#666;flex:0 0 auto;margin:0 4px 0 2px}
+.vdot.ok{background:#3fb950}.vdot.wait{background:#d29922}.vdot.off{background:#f85149}
+.vtools .zval{min-height:32px;display:inline-flex;align-items:center;padding:4px 7px;font-size:12px;background:var(--bg3);border-radius:6px;color:var(--dim);flex:0 0 auto;min-width:44px;justify-content:center}
+.vtools .refresh-countdown{min-height:32px;display:inline-flex;align-items:center;padding:4px 7px;font-size:12px;color:var(--dim);white-space:nowrap;flex:0 0 auto}
+.kbbar{position:absolute;left:0;right:0;bottom:0;display:flex;gap:6px;align-items:center;padding:6px 8px;background:rgba(12,19,38,.92);border-top:1px solid var(--line);z-index:6}
+.kbbar input{flex:1;min-height:34px}
+.kbbar button{min-height:32px;padding:4px 12px;font-size:12.5px}
+@media (min-width:769px){ #kb-bar{display:none!important} }
+#v-frame{touch-action:none}
+/* CSS 横屏兜底（orientation.lock 不可用时） */
+.viewer.rot{position:absolute;top:0;left:0;width:100vh;height:100vw;transform:rotate(90deg) translateY(-100%);transform-origin:top left;z-index:40;background:#05080f}
+.viewer.rot .viewport img{height:100%;width:auto;max-width:none}
+@media (max-width:768px){
+  body{font-size:13px;display:flex;flex-direction:column}
+  .wrap{flex:1;height:auto;min-height:0}
+  header{padding:6px 8px;flex-wrap:wrap;gap:5px;row-gap:4px}
+  header h1{font-size:14px;margin-right:2px}
+  nav.top{gap:4px}
+  nav.top button{min-height:30px;padding:4px 11px;font-size:12.5px}
+  header .right{gap:5px}
+  #status-text{display:none}
+  header .right button{min-height:28px;padding:3px 10px;font-size:12px}
+  .m-only{display:inline-flex!important}
+  #side-float{position:absolute;left:0;top:8px;z-index:29;min-height:26px;padding:3px 9px;font-size:12px;border-radius:0 999px 999px 0;box-shadow:3px 0 10px rgba(0,0,0,.45)}
+  button{min-height:32px;padding:5px 12px;font-size:13px}
+  input,select{min-height:34px;padding:6px 10px;font-size:13px}
+  label{margin:8px 0 3px}
+  .view{padding:6px}
+  .wrap{position:relative}
+  aside{position:absolute;z-index:30;top:0;bottom:0;left:0;width:262px;min-width:262px;box-shadow:8px 0 24px rgba(0,0,0,.5)}
+  aside.collapsed{margin-left:-262px}
+  .side-head{padding:4px}
+  .side-head button{min-height:26px;padding:2px 10px;font-size:12px}
+  .side-tools{padding:4px 7px 7px}
+  .side-tools .row{gap:5px;margin-bottom:5px}
+  .side-tools input,.side-tools select{min-height:30px;padding:5px 8px;font-size:12.5px}
+  .side-tools button{min-height:30px;padding:4px 8px;font-size:12px}
+  .list-title{padding:7px 10px 2px;font-size:12px}
+  .plist{padding:5px 7px 14px;gap:6px}
+  .pcard{padding:8px}
+  .pcard .m{margin:2px 0 6px;font-size:11px}
+  .pcard .acts{gap:5px}
+  .pcard .acts button{min-height:27px;padding:2px 9px;font-size:12px}
+  .dialog .row2{grid-template-columns:1fr}
+  .tab{font-size:12px;max-width:120px;padding:6px 9px}
+  .tab-add{width:30px;height:30px}
+  .navbar{gap:5px;padding:5px 6px}
+  .navbar .icon{width:34px;min-width:34px;padding:0;font-size:13px}
+  .navbar input{min-height:34px}
+  .vtools{display:flex}
+  .toolbar{gap:6px;margin-bottom:8px}
+  .toolbar h2{font-size:15px}
+  .toolbar button{min-height:30px;padding:4px 11px;font-size:12.5px}
+  .seg button{min-height:30px;padding:3px 10px;font-size:12.5px}
+  .table{font-size:12px}
+  .table th,.table td{padding:7px 6px}
+  .viewport img{width:100%;height:auto;max-height:100%;object-fit:contain}
+  .hint{font-size:12.5px;padding:12px}
+  .dialog{padding:14px;border-radius:12px}
+  .event{font-size:12px;padding:6px 9px}
+  .badge{font-size:11px}
+}
+</style>
+</head>
+<body>
+
+<header>
+  <nav class="top" id="topnav">
+    <button data-view="quick" class="active">快捷</button>
+    <button data-view="proxies">代理库</button>
+    <button data-view="logs">日志</button>
+    <button data-view="ops">运维管理</button>
+  </nav>
+  <div class="right">
+    <span class="badge"><span class="dot" id="dot-status"></span><span id="status-text">连接中</span></span>
+  </div>
+</header>
+
+<div class="wrap">
+  <button id="side-float">≡ 实例</button>
+  <aside id="sidebar">
+    <div class="side-head"><button class="ghost" id="btn-collapse">收起 ≪</button></div>
+    <div class="side-tools">
+      <div class="row"><input id="q" placeholder="搜索名称/备注/代理"></div>
+      <div class="row">
+        <select id="group-sel"><option value="">全部分组</option></select>
+        <button class="primary" id="btn-batch">批量创建</button>
+      </div>
+      <div class="row">
+        <button id="btn-new">新建</button>
+        <button id="btn-export">导出</button>
+        <button id="btn-import">导入</button>
+      </div>
+      <input type="file" id="import-file" accept=".json" style="display:none">
+    </div>
+    <div class="list-title">实例列表 <span id="p-count"></span></div>
+    <div class="plist" id="plist"></div>
+  </aside>
+
+  <main>
+    <!-- 快捷：实时浏览器 -->
+    <section class="view" id="view-quick">
+      <div class="viewer" id="viewer">
+        <div class="tabsbar" id="tabsbar"></div>
+        <div class="navbar" id="viewerbar" style="display:none">
+          <span class="vdot off" id="v-dot" title="连接状态"></span>
+          <button class="icon" id="v-back" title="后退">←</button>
+          <button class="icon" id="v-fwd" title="前进">→</button>
+          <button class="icon" id="v-reload" title="刷新">⟳</button>
+          <input id="v-url" placeholder="输入网址后回车（下拉显示历史）" list="urlhist" autocomplete="off">
+          <button class="icon" id="v-go" title="跳转" style="width:auto;min-width:40px;padding:0 10px;font-size:13px">跳转</button>
+          <datalist id="urlhist"></datalist>
+        </div>
+        <div class="vtools" id="vtools" style="display:none">
+          <button id="v-zout" title="缩小">－</button>
+          <span class="zval" id="v-zval">100%</span>
+          <button id="v-zin" title="放大">＋</button>
+          <button id="v-fs">全屏</button>
+          <select id="v-q" title="画质">
+            <option value="40">流畅</option>
+            <option value="62" selected>标清</option>
+            <option value="80">高清</option>
+          </select>
+           <select id="v-refresh" title="当前窗口自动刷新">
+             <option value="inherit">刷新:跟随实例</option>
+             <option value="0">刷新:关</option>
+            <option value="5">5秒</option>
+            <option value="15">15秒</option>
+            <option value="30">30秒</option>
+            <option value="60">1分钟</option>
+            <option value="120">2分钟</option>
+            <option value="300">5分钟</option>
+            <option value="600">10分钟</option>
+            <option value="1800">30分钟</option>
+             <option value="custom">自定义…</option>
+           </select>
+           <span id="v-refresh-countdown" class="refresh-countdown">未设置</span>
+        </div>
+        <div class="viewport" id="vport">
+          <div class="hint" id="v-hint">点击左侧实例卡片「打开」进行操作 · [+] 新开窗口 · 点击标签切换窗口</div>
+          <div class="state-badge hidden" id="v-state"></div>
+          <div class="kbbar" id="kb-bar">
+            <input id="kb-input" placeholder="点此输入，文字自动发到页面" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 代理库 -->
+    <section class="view hidden" id="view-proxies">
+      <div class="toolbar">
+        <h2>代理库</h2>
+        <button class="primary" id="px-new">新建代理</button>
+        <button id="px-reload">刷新</button>
+      </div>
+      <div style="overflow:auto;flex:1">
+        <table class="table" id="px-table"></table>
+      </div>
+    </section>
+
+    <!-- 日志 -->
+    <section class="view hidden" id="view-logs">
+      <div class="toolbar">
+        <h2>日志</h2>
+        <div class="seg" id="log-seg">
+          <button data-src="guard" class="active">守护事件</button>
+          <button data-src="op">操作日志</button>
+          <button data-src="refresh">刷新错误</button>
+        </div>
+        <button id="log-reload">刷新</button>
+      </div>
+      <div style="overflow:auto;flex:1" id="log-body"></div>
+    </section>
+
+    <!-- 运维管理 -->
+    <section class="view hidden" id="view-ops">
+      <div class="toolbar">
+        <h2>运维管理（opsbox · 已免密）</h2>
+        <button id="btn-ops-newtab">新标签页打开</button>
+      </div>
+      <iframe id="opsbox-frame" src="/opsbox/" style="width:100%;height:100%;border:1px solid var(--line);border-radius:12px;background:#fff"></iframe>
+    </section>
+  </main>
+</div>
+
+<!-- 设置 / 新建 实例 -->
+<div class="overlay hidden" id="dlg-mask">
+  <div class="dialog">
+    <h3 id="dlg-title">实例设置</h3>
+    <div class="muted" id="dlg-sub"></div>
+    <div class="alert" id="dlg-alert"></div>
+    <div class="row2">
+      <div><label>名称</label><input id="d-name"></div>
+      <div><label>分组</label><input id="d-group" placeholder="如 Workgroup"></div>
+      <div><label>启动页</label><input id="d-url" placeholder="https://"></div>
+      <div><label>窗口尺寸</label><input id="d-size" placeholder="1920x1080" list="sizehist" autocomplete="off"><datalist id="sizehist"><option value="1920x1080"><option value="1366x768"><option value="1440x900"><option value="1536x864"><option value="2560x1440"><option value="1280x720"></datalist></div>
+      <div><label>时区</label><input id="d-tz" placeholder="Asia/Shanghai"></div>
+      <div><label>语言</label><input id="d-lang" placeholder="zh-CN"></div>
+    </div>
+    <label>指纹信息 <button id="d-fp-random" type="button" style="float:right;padding:3px 10px;font-size:12px">🎲 一键随机</button></label>
+    <div class="row2">
+      <div><label>操作系统</label><select id="d-os"><option value="">保持不变</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="android">Android</option></select></div>
+      <div><label>CPU 核数</label><select id="d-cores"><option value="">保持不变</option><option value="2">2</option><option value="4">4</option><option value="6">6</option><option value="8">8</option><option value="12">12</option><option value="16">16</option></select></div>
+      <div><label>内存 (GB)</label><select id="d-mem"><option value="">保持不变</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="16">16</option></select></div>
+      <div><label>反跟踪 (DNT)</label><select id="d-dnt"><option value="">保持不变</option><option value="1">开启</option><option value="unset">关闭</option></select></div>
+    </div>
+    <label>UserAgent</label>
+    <input id="d-ua" placeholder="留空 = 不修改" spellcheck="false">
+    <div class="row2">
+      <div><label>WebGL 厂商</label><input id="d-wglv" placeholder="留空 = 不修改"></div>
+      <div><label>WebGL 渲染器</label><input id="d-wglr" placeholder="留空 = 不修改"></div>
+    </div>
+    <label>代理（留空保持不变；Direct 为直连）</label>
+    <input id="d-proxy" placeholder="http://user:pass@host:port 或 socks5://host:port">
+    <label>备注</label>
+    <input id="d-remark">
+    <div id="d-extra"></div>
+    <div class="btns" id="dlg-btns">
+      <button class="ghost" id="dlg-cancel">取消</button>
+      <button class="primary" id="dlg-save">保存</button>
+    </div>
+    <div class="btns" id="dlg-btns2" style="margin-top:10px">
+      <button id="d-refresh-cfg">定时刷新</button>
+      <button class="danger" id="d-delete">删除实例</button>
+    </div>
+  </div>
+</div>
+
+<!-- 登录 -->
+<div class="overlay hidden" id="login-mask">
+  <div class="dialog" style="max-width:340px">
+    <h3>OpenBrowser Web 控制台</h3>
+    <div class="muted">请输入控制台口令（本设备将记住登录）</div>
+    <div class="alert" id="login-alert"></div>
+    <input id="login-pwd" type="password" placeholder="控制台口令">
+    <div class="btns"><button class="primary" id="login-ok" style="width:100%">进入控制台</button></div>
+  </div>
+</div>
+
+<!-- 批量创建 -->
+<div class="overlay hidden" id="batch-mask">
+  <div class="dialog">
+    <h3>批量创建</h3>
+    <div class="muted">按名称前缀循环创建多个实例</div>
+    <div class="alert" id="batch-alert"></div>
+    <div class="row2">
+      <div><label>名称前缀</label><input id="b-prefix" value="Profile"></div>
+      <div><label>数量（1-50）</label><input id="b-count" type="number" min="1" max="50" value="2"></div>
+      <div><label>分组（可选）</label><input id="b-group"></div>
+      <div><label>启动页（可选）</label><input id="b-url" placeholder="https://"></div>
+    </div>
+    <div class="btns">
+      <button class="ghost" id="batch-cancel">取消</button>
+      <button class="primary" id="batch-ok">开始创建</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+const $ = (s) => document.querySelector(s);
+const state = {
+  token: localStorage.getItem('console_token') || '',
+  view: 'quick',
+  profiles: [],
+  current: null,          // 打开查看器的实例
+  viewer: { ws: null, targetId: null, deviceW: 0, deviceH: 0, msgId: 1, pending: {}, tabs: [], lastUrls: {}, superseded: false, refreshTimer: null, refreshLastFireAt: null },
+  logSrc: 'guard',
+  sideOpen: false,
+};
+
+function toast(msg, ms = 2600) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(state.token ? { 'x-console-token': state.token } : {}),
+      ...(options.headers || {}),
+    },
+  });
+  if (res.status === 401) { showLogin(); throw new Error('登录已过期'); }
+  const ct = res.headers.get('content-type') || '';
+  const body = ct.includes('json') ? await res.json() : await res.text();
+  if (!res.ok) throw new Error((body && body.msg) || ('HTTP ' + res.status));
+  return body;
+}
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ---------- 登录 ---------- */
+function showLogin() {
+  $('#login-alert').classList.remove('show');
+  $('#login-mask').classList.remove('hidden');
+  setTimeout(() => $('#login-pwd').focus(), 60);
+}
+
+async function doLogin() {
+  const pwd = $('#login-pwd').value;
+  if (!pwd) return;
+  const btn = $('#login-ok');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/console/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: pwd }) });
+    const b = await r.json();
+    if (r.status !== 200) throw new Error(b.msg || '登录失败');
+    state.token = b.data.token;
+    localStorage.setItem('console_token', state.token);
+    $('#login-mask').classList.add('hidden');
+    $('#login-pwd').value = '';
+    boot();
+  } catch (e) {
+    const el = $('#login-alert');
+    el.textContent = e.message;
+    el.classList.add('show');
+  }
+  btn.disabled = false;
+}
+
+$('#login-ok').addEventListener('click', doLogin);
+$('#login-pwd').addEventListener('keydown', (e) => { if (e.key === 'Enter') doLogin(); });
+
+/* ---------- 顶栏视图切换 ---------- */
+document.querySelectorAll('#topnav button').forEach((b) => b.addEventListener('click', () => {
+  state.view = b.dataset.view;
+  document.querySelectorAll('#topnav button').forEach((x) => x.classList.toggle('active', x === b));
+  ['quick', 'proxies', 'logs', 'ops'].forEach((v) => $('#view-' + v).classList.toggle('hidden', v !== state.view));
+  if (state.view === 'proxies') loadProxies();
+  if (state.view === 'logs') loadLogs();
+}));
+
+$('#btn-collapse').addEventListener('click', () => { $('#sidebar').classList.add('collapsed'); });
+$('#side-float').addEventListener('click', (e) => { e.stopPropagation(); $('#sidebar').classList.remove('collapsed'); });
+document.querySelector('.wrap').addEventListener('pointerdown', (e) => {
+  if (window.innerWidth > 768) return;
+  const sb = $('#sidebar');
+  if (sb.classList.contains('collapsed')) return;
+  if (e.target.closest('#sidebar') || e.target.closest('#side-float')) return;
+  sb.classList.add('collapsed');
+});
+
+/* ---------- 状态 ---------- */
+async function loadStatus() {
+  try {
+    const body = await api('/api/console/status');
+    const okLocal = body.data.localApi;
+    $('#dot-status').className = 'dot ' + (okLocal ? 'ok' : 'bad');
+    $('#status-text').textContent = okLocal ? 'Local API' : 'Local API 中断';
+  } catch (_) { /* ignored */ }
+}
+
+/* ---------- 实例列表 ---------- */
+function groupsOf(profiles) {
+  const set = new Set();
+  for (const p of profiles) {
+    const g = p.group || p.group_name || p.remark_group;
+    if (g) set.add(g);
+  }
+  return [...set];
+}
+
+async function loadProfiles() {
+  try {
+    const body = await api('/api/console/profiles');
+    state.profiles = body.data.list;
+    renderProfiles();
+  } catch (e) { toast(e.message); }
+}
+
+function profileMatches(p) {
+  const q = ($('#q').value || '').trim().toLowerCase();
+  const g = $('#group-sel').value;
+  if (g && (p.group || '') !== g) return false;
+  if (!q) return true;
+  return [p.name, p.remark, p.id, p.network && p.network.proxyRaw].join(' ').toLowerCase().includes(q);
+}
+
+function renderProfiles() {
+  const groups = groupsOf(state.profiles);
+  const sel = $('#group-sel');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">全部分组</option>' + groups.map((g) => `<option ${g === cur ? 'selected' : ''}>${esc(g)}</option>`).join('');
+  const list = state.profiles.filter(profileMatches);
+  $('#p-count').textContent = `(${list.length}/${state.profiles.length})`;
+  $('#plist').innerHTML = list.length ? list.map((p) => {
+    const running = p.status === 'Active';
+    const selected = state.current === p.id;
+    const picked = state.selected === p.id;
+    return `<div class="pcard ${selected || picked ? 'selected' : ''}" data-id="${esc(p.id)}">
+      <div class="t"><span class="tag ${running ? 'on' : ''}">${running ? 'Active' : 'Inactive'}</span><span class="name">#${esc(p.number)} ${esc(p.name)}</span></div>
+      <div class="m">${esc(p.remark || p.group || '')}${p.guard ? ` · RSS ${p.guard.rssMb}MB` : ''}</div>
+      <div class="acts">
+        <button data-act="start" ${running ? 'disabled' : ''}>启动</button>
+        <button data-act="stop" ${running ? '' : 'disabled'}>停止</button>
+        <button data-act="settings">设置</button>
+        <button data-act="del" class="danger">删除</button>
+      </div>
+    </div>`;
+  }).join('') : '<div class="muted" style="padding:14px">暂无实例，点击「新建」或「批量创建」。</div>';
+}
+
+['#q', '#group-sel'].forEach((s) => $(s).addEventListener('input', renderProfiles));
+
+$('#plist').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-act]');
+  const card = e.target.closest('.pcard');
+  if (!card) return;
+  const id = card.dataset.id;
+  if (!btn) {
+    // 点卡片 = 选中并直接展示该实例最后打开的页面
+    if (state.selected === id) state.selected = null;
+    openViewer(id);
+    return;
+  }
+  const act = btn.dataset.act;
+  if (act === 'settings') { openSettings(id); return; }
+  btn.disabled = true;
+  try {
+    if (act === 'start') {
+      btn.innerHTML = '<span class="spinner"></span>';
+      await api(`/api/console/profiles/${encodeURIComponent(id)}/start`, { method: 'POST' });
+      toast('已发送启动指令');
+    } else if (act === 'stop') {
+      btn.innerHTML = '<span class="spinner"></span>';
+      await api(`/api/console/profiles/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+      if (state.current === id) closeViewer();
+      toast('已停止，可稍后手动启动');
+    } else if (act === 'del') {
+      if (!confirm('确认删除该实例及其数据？')) { btn.disabled = false; return; }
+      await api(`/api/console/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+      if (state.current === id) closeViewer();
+      toast('已删除');
+    }
+  } catch (err) { toast(err.message); }
+  loadProfiles();
+});
+
+/* ---------- 新建 / 批量创建 / 导入导出 ---------- */
+$('#btn-new').addEventListener('click', () => openDialog(null));
+
+$('#btn-batch').addEventListener('click', () => {
+  $('#batch-alert').classList.remove('show');
+  $('#batch-mask').classList.remove('hidden');
+});
+$('#batch-cancel').addEventListener('click', () => $('#batch-mask').classList.add('hidden'));
+$('#batch-ok').addEventListener('click', async () => {
+  const btn = $('#batch-ok');
+  btn.disabled = true;
+  try {
+    const body = await api('/api/console/profiles/batch', {
+      method: 'POST',
+      body: JSON.stringify({
+        prefix: $('#b-prefix').value || 'Profile',
+        count: Number($('#b-count').value) || 1,
+        group_name: $('#b-group').value || undefined,
+        startUrl: $('#b-url').value || undefined,
+      }),
+    });
+    const okN = body.data.results.filter((r) => r.ok).length;
+    toast(`批量创建完成：成功 ${okN}/${body.data.results.length}`);
+    $('#batch-mask').classList.add('hidden');
+    loadProfiles();
+  } catch (e) {
+    const el = $('#batch-alert');
+    el.textContent = e.message;
+    el.classList.add('show');
+  }
+  btn.disabled = false;
+});
+
+$('#btn-export').addEventListener('click', async () => {
+  try {
+    const res = await fetch('/api/console/profiles/export', { headers: { 'x-console-token': state.token } });
+    if (!res.ok) throw new Error('导出失败');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `openbrowser-profiles-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('已导出');
+  } catch (e) { toast(e.message); }
+});
+
+$('#btn-import').addEventListener('click', () => $('#import-file').click());
+$('#import-file').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    const profiles = Array.isArray(parsed) ? parsed : parsed.profiles;
+    if (!Array.isArray(profiles)) throw new Error('JSON 格式不正确（需要 profiles 数组）');
+    const body = await api('/api/console/profiles/import', { method: 'POST', body: JSON.stringify({ profiles }) });
+    toast(`导入完成：成功 ${body.data.ok}/${body.data.total}，失败 ${body.data.failed}`);
+    loadProfiles();
+  } catch (err) { toast(err.message); }
+});
+
+/* ---------- 设置 / 删除 / 随机指纹 / 刷新配置 ---------- */
+function openDialog(profile) {
+  $('#dlg-alert').classList.remove('show');
+  $('#dlg-title').textContent = profile ? '实例设置' : '新建实例';
+  $('#dlg-sub').textContent = profile ? `#${profile.number} · ${profile.id}` : '创建一个新的浏览器实例';
+  $('#d-name').value = profile ? profile.name : '';
+  $('#d-group').value = profile ? (profile.group || '') : '';
+  $('#d-url').value = profile ? (profile.startUrl || '') : '';
+  $('#d-size').value = profile ? (profile.windowSize || '') : '';
+  $('#d-tz').value = profile ? (profile.timezone || '') : '';
+  $('#d-lang').value = profile ? (profile.languageCode || '') : '';
+  $('#d-proxy').value = '';
+  $('#d-remark').value = profile ? (profile.remark || '') : '';
+  $('#d-extra').innerHTML = '';
+  // 指纹信息回填
+  $('#d-os').value = profile ? (profile.os || '') : '';
+  $('#d-cores').value = profile && profile.hardwareConcurrency ? String(profile.hardwareConcurrency) : '';
+  $('#d-mem').value = profile && profile.deviceMemory ? String(profile.deviceMemory) : '';
+  $('#d-dnt').value = profile && typeof profile.doNotTrack === 'boolean' ? (profile.doNotTrack ? '1' : 'unset') : '';
+  $('#d-ua').value = profile ? (profile.userAgent || '') : '';
+  $('#d-wglv').value = profile ? (profile.webglVendor || '') : '';
+  $('#d-wglr').value = profile ? (profile.webglRenderer || '') : '';
+  $('#d-delete').classList.toggle('hidden', !profile);
+  $('#dlg-mask').classList.remove('hidden');
+  $('#dlg-save').dataset.id = profile ? profile.id : '';
+}
+
+async function openSettings(id) {
+  try {
+    const body = await api(`/api/console/profiles/${encodeURIComponent(id)}`);
+    openDialog(body.data.profile || { id });
+  } catch (e) { toast(e.message); }
+}
+
+$('#dlg-cancel').addEventListener('click', () => $('#dlg-mask').classList.add('hidden'));
+$('#dlg-mask').addEventListener('click', (e) => { if (e.target === $('#dlg-mask')) $('#dlg-mask').classList.add('hidden'); });
+
+$('#dlg-save').addEventListener('click', async () => {
+  const id = $('#dlg-save').dataset.id;
+  const payload = {};
+  if ($('#d-name').value) payload.name = $('#d-name').value;
+  if ($('#d-group').value) payload.group_name = $('#d-group').value;
+  if ($('#d-url').value) payload.startUrl = $('#d-url').value;
+  payload.windowSize = $('#d-size').value.trim() || '1920x1080';
+  payload.resolution = payload.windowSize;
+  if ($('#d-tz').value) payload.timezone = $('#d-tz').value;
+  if ($('#d-lang').value) { payload.languageCode = $('#d-lang').value; payload.locale = $('#d-lang').value; }
+  if ($('#d-remark').value) payload.note = $('#d-remark').value;
+  if ($('#d-proxy').value) payload.proxy = $('#d-proxy').value;
+  // 指纹信息：填了才提交
+  const osMap = { windows: 'Win32', macos: 'MacIntel', android: 'Linux armv8l' };
+  let hasFp = false;
+  if ($('#d-os').value) { payload.os = $('#d-os').value; payload.platform = osMap[$('#d-os').value]; hasFp = true; }
+  if ($('#d-ua').value.trim()) { payload.userAgent = $('#d-ua').value.trim(); hasFp = true; }
+  if ($('#d-wglv').value.trim()) { payload.webglVendor = $('#d-wglv').value.trim(); hasFp = true; }
+  if ($('#d-wglr').value.trim()) { payload.webglRenderer = $('#d-wglr').value.trim(); hasFp = true; }
+  if ($('#d-cores').value) { payload.hardwareConcurrency = Number($('#d-cores').value); hasFp = true; }
+  if ($('#d-mem').value) { payload.deviceMemory = Number($('#d-mem').value); hasFp = true; }
+  if ($('#d-dnt').value !== '') { payload.doNotTrack = $('#d-dnt').value; hasFp = true; }
+  try {
+    if (id) {
+      await api(`/api/console/profiles/${encodeURIComponent(id)}`, { method: 'POST', body: JSON.stringify(payload) });
+      toast('设置已保存');
+      if (hasFp) {
+        const cur = (state.profiles || []).find((p) => p.id === id);
+        if (cur && cur.status === 'Active' && confirm('指纹已保存，将在实例下次启动时生效。\n是否立即重启实例使其生效？')) {
+          await api(`/api/console/profiles/${encodeURIComponent(id)}/stop`, { method: 'POST' });
+          await api(`/api/console/profiles/${encodeURIComponent(id)}/start`, { method: 'POST' });
+          toast('实例已重启，指纹已生效');
+          if (state.current === id) { closeViewer(); setTimeout(() => openViewer(id), 2500); }
+        }
+      }
+    } else {
+      const created = await api('/api/console/profiles/import', { method: 'POST', body: JSON.stringify({ profiles: [payload] }) });
+      const newId = created.data && created.data.results && created.data.results[0] && created.data.results[0].id;
+      if (hasFp && newId) {
+        try { await api(`/api/console/profiles/${encodeURIComponent(newId)}`, { method: 'POST', body: JSON.stringify(payload) }); } catch (_) { /* 基础字段已带大部分指纹 */ }
+      }
+      toast('实例已创建');
+    }
+    $('#dlg-mask').classList.add('hidden');
+    loadProfiles();
+  } catch (e) {
+    const el = $('#dlg-alert');
+    el.textContent = e.message;
+    el.classList.add('show');
+  }
+});
+
+$('#d-delete').addEventListener('click', async () => {
+  const id = $('#dlg-save').dataset.id;
+  if (!id || !confirm('确认删除该实例及其数据？')) return;
+  try {
+    await api(`/api/console/profiles/${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (state.current === id) closeViewer();
+    $('#dlg-mask').classList.add('hidden');
+    toast('已删除');
+    loadProfiles();
+  } catch (e) { toast(e.message); }
+});
+
+$('#d-fp-random').addEventListener('click', async () => {
+  const btn = $('#d-fp-random');
+  btn.disabled = true;
+  btn.textContent = '生成中…';
+  try {
+    const body = await api('/api/console/fingerprint-random');
+    const p = body.data;
+    // 只填表单，保存时才生效
+    $('#d-os').value = p.os || '';
+    $('#d-size').value = p.windowSize || '';
+    $('#d-tz').value = p.timezone || '';
+    $('#d-lang').value = p.languageCode || '';
+    $('#d-ua').value = p.userAgent || '';
+    $('#d-wglv').value = p.webglVendor || '';
+    $('#d-wglr').value = p.webglRenderer || '';
+    $('#d-cores').value = p.hardwareConcurrency ? String(p.hardwareConcurrency) : '';
+    $('#d-mem').value = p.deviceMemory ? String(p.deviceMemory) : '';
+    $('#d-dnt').value = p.doNotTrack === '1' || p.doNotTrack === true ? '1' : 'unset';
+    toast('已生成随机指纹（填入表单），点「保存」生效');
+  } catch (e) { toast(e.message); }
+  btn.disabled = false;
+  btn.textContent = '🎲 一键随机';
+});
+
+$('#d-refresh-cfg').addEventListener('click', async () => {
+  const id = $('#dlg-save').dataset.id;
+  if (!id) return toast('请先保存实例');
+  const cur = await api(`/api/console/profiles/${encodeURIComponent(id)}/refresh`);
+  const input = prompt('定时刷新间隔（秒，0=关闭，≥5 生效）：', cur.data.intervalSec || 0);
+  if (input == null) return;
+  const interval = Number(input) || 0;
+  try {
+    await api(`/api/console/profiles/${encodeURIComponent(id)}/refresh`, {
+      method: 'PUT',
+      body: JSON.stringify({ intervalSec: interval, scope: cur.data.scope || 'active', enabled: interval >= 5 }),
+    });
+    toast(interval >= 5 ? `定时刷新已启用（每 ${interval}s，${cur.data.scope === 'all' ? '全部标签' : '活动标签'}）` : '定时刷新已关闭');
+  } catch (e) { toast(e.message); }
+});
+
+/* ---------- 实时浏览器查看器 ---------- */
+
+async function cdpSend(method, params) {
+  const v = state.viewer;
+  // HTTP 兼容模式：指令走 REST
+  if (v.mode === 'poll') {
+    if (!state.current || !v.targetId) throw new Error('未连接');
+    const body = await api(`/api/cast/cmd/${encodeURIComponent(state.current)}/${encodeURIComponent(v.targetId)}`, { method: 'POST', body: JSON.stringify({ method, params }) });
+    if (body.code !== 0) throw new Error(body.msg || 'CDP error');
+    return body.data;
+  }
+  if ((!v.ws || v.ws.readyState !== 1) && v.targetId && state.current) {
+    await waitWs(4000).catch(() => {});
+  }
+  if (!v.ws || v.ws.readyState !== 1) throw new Error('连接断开，正在自动重连…');
+  const id = v.msgId++;
+  return new Promise((resolve, reject) => {
+    v.pending[id] = { resolve, reject };
+    v.ws.send(JSON.stringify({ id, method, params }));
+    setTimeout(() => {
+      if (v.pending[id]) { delete v.pending[id]; reject(new Error('CDP 超时: ' + method)); }
+    }, 10000);
+  });
+}
+
+// 等待 WS 就绪；期间触发一次重连
+function waitWs(ms) {
+  const v = state.viewer;
+  if (v.ws && v.ws.readyState === 1) return Promise.resolve();
+  if (!v.connecting) {
+    v.connecting = new Promise((resolve, reject) => {
+      const t0 = Date.now();
+      const iv = setInterval(() => {
+        if (v.ws && v.ws.readyState === 1) { clearInterval(iv); v.connecting = null; resolve(); }
+        else if (Date.now() - t0 > ms) { clearInterval(iv); v.connecting = null; reject(new Error('timeout')); }
+      }, 150);
+    });
+    if (!v.ws && v.targetId && state.current) connectTab(state.current, v.targetId);
+  }
+  return v.connecting;
+}
+
+function wsUrl(profileId, targetId) {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${proto}//${location.host}/cdp/${encodeURIComponent(profileId)}/${encodeURIComponent(targetId)}?token=${encodeURIComponent(state.token)}`;
+}
+
+function castParams() {
+  return { format: 'jpeg', quality: Number($('#v-q').value || 62), maxWidth: 1920, maxHeight: 1200, everyNthFrame: 1 };
+}
+
+function setVDot(st) {
+  const d = $('#v-dot');
+  if (d) d.className = 'vdot ' + st;
+}
+
+// HTTP 兼容模式：WSS 被网络拦截时的兜底，约 1 秒 1 帧 + 指令走 REST
+function startPoll() {
+  const v = state.viewer;
+  if (v.mode === 'poll') return;
+  v.mode = 'poll';
+  setVDot('wait');
+  showState('已切换 HTTP 兼容模式（约 1 秒 1 帧），正在恢复画面…');
+  clearInterval(v.pollTimer);
+  v.pollTimer = setInterval(pollFrame, 1000);
+  pollFrame();
+  // 后台每 15s 试探 WSS，通了就切回
+  clearInterval(v.wsRecover);
+  v.wsRecover = setInterval(() => {
+    if (document.visibilityState !== 'visible' || !state.current || !v.targetId) return;
+    const test = new WebSocket(wsUrl(state.current, v.targetId));
+    const t = setTimeout(() => { try { test.close(); } catch (_) {} }, 6000);
+    test.onopen = () => {
+      clearTimeout(t);
+      clearInterval(v.wsRecover);
+      v.wsRecover = null;
+      v.mode = 'ws';
+      v.wsFail = 0;
+      toast('已恢复实时模式');
+      connectTab(state.current, v.targetId);
+    };
+    test.onerror = () => clearTimeout(t);
+  }, 15000);
+}
+
+function stopPoll() {
+  const v = state.viewer;
+  clearInterval(v.pollTimer);
+  v.pollTimer = null;
+  clearInterval(v.wsRecover);
+  v.wsRecover = null;
+  if (v.mode === 'poll') v.mode = 'ws';
+}
+
+async function pollFrame() {
+  const v = state.viewer;
+  if (v.mode !== 'poll' || !state.current || !v.targetId) return;
+  if (document.visibilityState !== 'visible') return;
+  try {
+    const body = await api(`/api/cast/shot/${encodeURIComponent(state.current)}/${encodeURIComponent(v.targetId)}`);
+    if (body.code !== 0) throw new Error(body.msg || 'shot fail');
+    v.framesReceived = (v.framesReceived || 0) + 1;
+    v.lastFrame = Date.now();
+    v.stall = 0;
+    setVDot('ok');
+    renderFrame({ data: body.data.image, metadata: { deviceWidth: body.data.w, deviceHeight: body.data.h } });
+  } catch (_) { setVDot('wait'); }
+}
+
+function connectTab(profileId, targetId) {
+  const v = state.viewer;
+  const switchSeq = (v.switchSeq || 0) + 1;
+  v.switchSeq = switchSeq;
+  if (v.mode === 'poll') {
+    // 兼容模式下仅切换目标，轮询自动跟随；立即拉一帧加速切换
+    v.targetId = targetId;
+    v.deviceW = v.deviceH = 0;
+    pollFrame();
+    return;
+  }
+  if (v.ws) { try { v.ws.close(); } catch (_) {} v.ws = null; }
+  clearInterval(v.pingTimer);
+  clearInterval(v.watch);
+  v.targetId = targetId;
+  v.deviceW = v.deviceH = 0;
+  v.lastFrame = Date.now();
+  v.stall = 0;
+  const ws = new WebSocket(wsUrl(profileId, targetId));
+  v.ws = ws;
+  setVDot('wait');
+  const connT = setTimeout(() => { if (v.ws === ws && ws.readyState !== 1) { try { ws.close(); } catch (_) {} } }, 8000);
+  ws.onopen = () => {
+    if (v.switchSeq !== switchSeq || v.ws !== ws) {
+      try { ws.close(); } catch (_) {}
+      return;
+    }
+    clearTimeout(connT);
+    v.reconnect = 0;
+    v.wsFail = 0;
+    v.superseded = false;
+    setVDot('ok');
+    ws.send(JSON.stringify({ id: v.msgId++, method: 'Page.enable', params: {} }));
+    ws.send(JSON.stringify({ id: v.msgId++, method: 'Page.startScreencast', params: castParams() }));
+    clearInterval(v.pingTimer);
+    v.pingTimer = setInterval(() => {
+      if (ws.readyState === 1) { try { ws.send(JSON.stringify({ bridge: 'ping' })); } catch (_) {} }
+    }, 12000);
+    clearInterval(v.watch);
+    v.lastCdp = Date.now();
+    v.watch = setInterval(() => {
+      if (ws.readyState !== 1) return;
+      // CDP 存活探测：链路和渲染进程都活着时，页面静止不出帧属于正常，禁止断连
+      try { ws.send(JSON.stringify({ id: v.msgId++, method: 'Runtime.evaluate', params: { expression: '1', returnByValue: true } })); } catch (_) {}
+      const frameStale = Date.now() - (v.lastFrame || 0) > 25000;
+      const cdpStale = Date.now() - (v.lastCdp || 0) > 25000;
+      if (frameStale && cdpStale) {
+        v.stall += 1;
+        if (v.stall >= 2) { try { ws.close(); } catch (_) {} }
+        else { try { ws.send(JSON.stringify({ id: v.msgId++, method: 'Page.startScreencast', params: castParams() })); } catch (_) {} }
+      } else if (!frameStale) {
+        v.stall = 0;
+      }
+    }, 10000);
+  };
+  ws.onmessage = (ev) => {
+    if (v.switchSeq !== switchSeq || v.ws !== ws) return;
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.bridge === 'pong') return;
+    if (msg.bridge === 'error') {
+      if (msg.code === 'superseded') {
+        // 被其他连接接管：停止自动重连（否则两台设备会互相踢，画面永远在重连）
+        v.superseded = true;
+        showState('画面已在其他窗口/设备打开。点此接管画面（对方将被断开）');
+        $('#v-state').onclick = () => { v.superseded = false; v.reconnect = 0; connectTab(profileId, targetId); };
+      } else {
+        showState(msg.message);
+      }
+      return;
+    }
+    if (msg.id) {
+      v.lastCdp = Date.now();
+      if (v.pending[msg.id]) {
+        const p = v.pending[msg.id];
+        delete v.pending[msg.id];
+        if (msg.error) p.reject(new Error(msg.error.message || 'CDP error'));
+        else p.resolve(msg.result);
+        return;
+      }
+    }
+    if (msg.method === 'Page.screencastFrame') {
+      v.lastFrame = Date.now();
+      v.framesReceived = (v.framesReceived || 0) + 1;
+      v.stall = 0;
+      renderFrame(msg.params);
+      ws.send(JSON.stringify({ id: v.msgId++, method: 'Page.screencastFrameAck', params: { sessionId: msg.params.sessionId } }));
+    } else if (msg.method === 'Page.frameNavigated' && msg.params.frame && msg.params.frame.url && !msg.params.frame.parentId) {
+      $('#v-url').value = msg.params.frame.url;
+      rememberUrl(msg.params.frame.url);
+    }
+  };
+  ws.onclose = () => {
+    clearTimeout(connT);
+    if (v.ws !== ws) return;
+    v.ws = null;
+    clearInterval(v.pingTimer);
+    clearInterval(v.watch);
+    if (state.current === profileId && state.view === 'quick') {
+      if (v.superseded) return; // 被接管后不自动抢回，等用户手动点击
+      v.wsFail = (v.wsFail || 0) + 1;
+      if (v.wsFail >= 2) startPoll();
+      v.reconnect = (v.reconnect || 0) + 1;
+      setVDot('wait');
+      showState(v.reconnect <= 3 ? '连接断开，自动重连中…'
+        : `自动重连中（第 ${v.reconnect} 次，点击立即重试）· 实例仍在后台运行`);
+      $('#v-state').onclick = () => { v.reconnect = 0; connectTab(profileId, targetId); };
+      setTimeout(() => {
+        if (state.current === profileId && !v.ws) connectTab(profileId, targetId);
+      }, Math.min(5000, 500 * v.reconnect));
+    }
+  };
+  ws.onerror = () => {};
+}
+
+function renderFrame(params) {
+  const v = state.viewer;
+  let img = $('#v-frame');
+  if (!img) {
+    $('#vport').insertAdjacentHTML('beforeend', '<img id="v-frame" alt="">');
+    img = $('#v-frame');
+    bindInput(img);
+  }
+  v.deviceW = params.metadata.deviceWidth || v.deviceW;
+  v.deviceH = params.metadata.deviceHeight || v.deviceH;
+  img.src = 'data:image/jpeg;base64,' + params.data;
+  if (window.innerWidth > 768) { try { img.focus({ preventScroll: true }); } catch (_) {} }
+  $('#v-hint').classList.add('hidden');
+  $('#v-state').classList.add('hidden');
+}
+
+function showState(text) {
+  const el = $('#v-state');
+  el.textContent = text;
+  el.classList.remove('hidden');
+}
+
+async function openViewer(profileId) {
+  state.current = profileId;
+  if (window.innerWidth <= 768) $('#sidebar').classList.add('collapsed');
+  if (state.view !== 'quick') document.querySelector('#topnav button[data-view="quick"]').click();
+  renderProfiles();
+  $('#v-url').value = '';
+  loadUrlHist();
+  $('#v-hint').classList.remove('hidden');
+  $('#v-hint').textContent = '正在连接实例…';
+  let frame = $('#v-frame');
+  if (frame) { frame.remove(); frame = null; }
+  await refreshTabs();
+  if (!state.viewer.tabs.length) {
+    showState('实例已停止');
+    $('#v-hint').classList.add('hidden');
+    return;
+  }
+  state.viewer.framesReceived = 0;
+  connectTab(profileId, latestTabId() || state.viewer.tabs[0].id);
+  syncRefreshUi(false);
+  // 15 秒仍未收到首帧：按真实原因提示（崩溃页/被接管/链路异常），避免误导为网络问题
+  setTimeout(() => {
+    const v = state.viewer;
+    if (state.current === profileId && !v.framesReceived) {
+      if (v.superseded) return;
+      const cur = v.tabs.find((t) => t.id === v.targetId);
+      if (cur && !cur.url && !v.lastUrls[v.targetId]) {
+        showState('页面已崩溃（网页进程异常终止）。点地址栏旁的刷新按钮（⟳）恢复画面');
+        $('#v-state').onclick = () => $('#v-reload').click();
+      } else {
+        showState('画面通道暂未建立，正在自动重连…；若持续失败，点地址栏旁的刷新按钮（⟳）重载该窗口');
+      }
+    }
+  }, 15000);
+}
+
+function closeViewer() {
+  const v = state.viewer;
+  if (v.ws) { try { v.ws.close(); } catch (_) {} }
+  v.ws = null;
+  v.targetId = null;
+  v.tabs = [];
+  v.reconnect = 0;
+  v.stall = 0;
+  v.wsFail = 0;
+  v.superseded = false;
+  stopPoll();
+  clearInterval(v.refreshTimer);
+  v.refreshTimer = null;
+  v.refreshLastFireAt = null;
+  v.mode = 'ws';
+  clearInterval(v.pingTimer);
+  clearInterval(v.watch);
+  setVDot('off');
+  const vsel = $('#v-refresh');
+  if (vsel) vsel.value = 'inherit';
+  $('#v-refresh-countdown').textContent = '未设置';
+  state.current = null;
+  $('#tabsbar').innerHTML = '';
+  $('#viewerbar').style.display = 'none';
+  $('#vtools').style.display = 'none';
+  const img = $('#v-frame');
+  if (img) img.remove();
+  $('#v-hint').classList.remove('hidden');
+  $('#v-hint').textContent = '点击左侧实例卡片「打开」进行操作 · [+] 新开窗口 · 点击标签切换窗口';
+  $('#v-state').classList.add('hidden');
+}
+
+function formatRefreshCountdown(ms) {
+  if (ms <= 0) return '刷新中…';
+  const total = Math.ceil(ms / 1000);
+  const minutes = Math.floor(total / 60);
+  const seconds = total % 60;
+  return `下次刷新 ${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatRefreshInterval(seconds) {
+  if (seconds >= 3600 && seconds % 3600 === 0) return `${seconds / 3600}小时`;
+  if (seconds >= 60 && seconds % 60 === 0) return `${seconds / 60}分钟`;
+  return `${seconds}秒`;
+}
+
+function ensureRefreshOption(value) {
+  const select = $('#v-refresh');
+  if (!select) return;
+  if (![...select.options].some((option) => option.value === String(value))) {
+    const option = document.createElement('option');
+    option.value = String(value);
+    option.textContent = `${value}秒`;
+    select.appendChild(option);
+  }
+}
+
+function flashAutoReload(ts) {
+  const port = $('#vport');
+  if (!port) return;
+  let el = $('#v-reload-flash');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'v-reload-flash';
+    el.className = 'reload-flash';
+    port.appendChild(el);
+  }
+  el.textContent = `⟳ 已自动刷新 ${new Date(ts).toLocaleTimeString()}`;
+  el.classList.add('show');
+  clearTimeout(flashAutoReload._t);
+  flashAutoReload._t = setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+function syncRefreshUi(showNotice = true) {
+  const v = state.viewer;
+  const tab = v.tabs.find((item) => item.id === v.targetId);
+  const info = tab && tab.refresh;
+  const select = $('#v-refresh');
+  const countdown = $('#v-refresh-countdown');
+  clearInterval(v.refreshTimer);
+  v.refreshTimer = null;
+  if (!info || !select || !countdown) {
+    if (select) select.value = 'inherit';
+    if (countdown) countdown.textContent = '未设置';
+    return;
+  }
+  if (info.source === 'window') {
+    if (info.enabled && info.intervalSec >= 5) {
+      ensureRefreshOption(info.intervalSec);
+      select.value = String(info.intervalSec);
+    } else {
+      select.value = '0';
+    }
+  } else {
+    select.value = 'inherit';
+    const inheritOption = [...select.options].find((option) => option.value === 'inherit');
+    if (inheritOption) {
+      inheritOption.textContent = info.enabled && info.intervalSec >= 5
+        ? `刷新:实例默认（${formatRefreshInterval(info.intervalSec)}）`
+        : '刷新:实例默认（关闭）';
+    }
+  }
+  if (v.refreshTargetId !== v.targetId) {
+    v.refreshTargetId = v.targetId;
+    v.refreshLastFireAt = info.lastFireAt;
+  } else if (showNotice && info.lastFireAt && v.refreshLastFireAt && info.lastFireAt > v.refreshLastFireAt) {
+    flashAutoReload(info.lastFireAt);
+    toast(`已自动刷新 ${new Date(info.lastFireAt).toLocaleTimeString()}`);
+    v.refreshLastFireAt = info.lastFireAt;
+  } else if (info.lastFireAt) {
+    v.refreshLastFireAt = info.lastFireAt;
+  }
+  const render = () => {
+    if (!info.enabled || !info.nextFireAt) {
+      countdown.textContent = info.source === 'instance' ? '实例默认 · 已关闭' : '未设置';
+      return;
+    }
+    const source = info.source === 'instance' ? '实例默认 · ' : '窗口设置 · ';
+    countdown.textContent = source + formatRefreshCountdown(info.nextFireAt - Date.now());
+  };
+  render();
+  v.refreshTimer = setInterval(render, 1000);
+}
+
+$('#v-refresh').addEventListener('change', async () => {
+  const v = state.viewer;
+  if (!state.current || !v.targetId) return;
+  let value = $('#v-refresh').value;
+  if (value === 'custom') {
+    value = prompt('当前窗口刷新间隔（秒，0=关闭，至少 5 秒）：', '60');
+    if (value == null) { syncRefreshUi(false); return; }
+    value = String(Math.max(0, Number(value) || 0));
+  }
+  try {
+    const body = value === 'inherit'
+      ? { inherit: true }
+      : { intervalSec: Number(value) || 0, enabled: Number(value) >= 5 };
+    await api(`/api/console/profiles/${encodeURIComponent(state.current)}/refresh/window/${encodeURIComponent(v.targetId)}`, {
+      method: 'PUT', body: JSON.stringify(body),
+    });
+    toast(value === 'inherit' ? '当前窗口已跟随实例刷新' : (Number(value) >= 5 ? '当前窗口刷新已设置' : '当前窗口刷新已关闭'));
+    await refreshTabs();
+  } catch (error) {
+    toast(error.message);
+    syncRefreshUi(false);
+  }
+});
+
+async function refreshTabs() {
+  const v = state.viewer;
+   if (!state.current) return;
+   try {
+     const body = await api(`/api/console/profiles/${encodeURIComponent(state.current)}/targets`);
+     v.tabs = body.data.targets || [];
+     for (const t of v.tabs) if (t.url) v.lastUrls[t.id] = t.url;
+     renderTabs(body.data.running);
+    syncRefreshUi();
+    if (v.targetId && !v.tabs.some((t) => t.id === v.targetId)) {
+      if (v.tabs.length) connectTab(state.current, latestTabId() || v.tabs[0].id);
+      else { showState('实例已停止'); const img = $('#v-frame'); if (img) img.remove(); $('#viewerbar').style.display = 'none'; $('#vtools').style.display = 'none'; }
+    }
+  } catch (_) { /* ignored */ }
+}
+
+// CDP /json 列表按创建顺序追加：末尾 = 最后打开/新建的页面
+function latestTabId() {
+  const tabs = state.viewer.tabs || [];
+  return tabs.length ? tabs[tabs.length - 1].id : null;
+}
+
+function renderTabs(running) {
+  const v = state.viewer;
+  const bar = $('#tabsbar');
+  $('#viewerbar').style.display = running && v.tabs.length ? 'flex' : 'none';
+  $('#vtools').style.display = running && v.tabs.length ? 'flex' : 'none';
+  bar.innerHTML = v.tabs.map((t) => `
+    <div class="tab ${t.id === v.targetId ? 'active' : ''}" data-id="${esc(t.id)}">
+      <span class="tt">${esc(t.title || t.url || '新标签页')}</span><span class="x" data-close="${esc(t.id)}">×</span>
+    </div>`).join('') + (running ? '<button class="tab-add" id="tab-add">+</button>' : '');
+  if (running && !v.tabs.length) showState('实例已停止');
+}
+
+$('#tabsbar').addEventListener('click', async (e) => {
+  const add = e.target.closest('#tab-add');
+  if (add) {
+    try {
+      const created = await api(`/api/console/profiles/${encodeURIComponent(state.current)}/targets`, { method: 'POST', body: JSON.stringify({ action: 'new', url: 'about:blank' }) });
+      const newId = created.data && created.data.id;
+      if (newId) {
+        connectTab(state.current, newId);
+        syncRefreshUi(false);
+        // 列表稍后才会包含新标签，延迟刷新以校正高亮
+        setTimeout(() => { refreshTabs(); }, 600);
+      } else {
+        await refreshTabs();
+        const last = latestTabId();
+        if (last) connectTab(state.current, last);
+      }
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  const x = e.target.closest('[data-close]');
+  if (x) {
+    e.stopPropagation();
+    try {
+      await api(`/api/console/profiles/${encodeURIComponent(state.current)}/targets`, { method: 'POST', body: JSON.stringify({ action: 'close', targetId: x.dataset.close }) });
+      await refreshTabs();
+    } catch (err) { toast(err.message); }
+    return;
+  }
+  const tab = e.target.closest('.tab');
+  if (tab) {
+    connectTab(state.current, tab.dataset.id);
+    syncRefreshUi(false);
+  }
+});
+
+setInterval(() => { if (state.current && state.view === 'quick') refreshTabs(); }, 4000);
+
+// 手机锁屏/切后台会冻结定时器和 WS，回前台立即恢复连接
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  const v = state.viewer;
+  if (!state.current || state.view !== 'quick') return;
+  if (v.ws && v.ws.readyState === 1) {
+    v.lastFrame = 0;
+    v.stall = 1;
+    try { v.ws.send(JSON.stringify({ bridge: 'ping' })); } catch (_) {}
+  } else if (v.ws && v.ws.readyState === 0) {
+    /* 正在连接 */
+  } else if (v.targetId) {
+    v.reconnect = 0;
+    connectTab(state.current, v.targetId);
+  }
+});
+
+/* ---------- 查看器交互（输入派发） ---------- */
+function bindInput(img) {
+  const toCdp = (p) => {
+    const rect = img.getBoundingClientRect();
+    const v = state.viewer;
+    const rot = $('#viewer').classList.contains('rot');
+    let rx = p.clientX - rect.left, ry = p.clientY - rect.top;
+    if (rot) {
+      // rotate(90deg)：内容坐标 x=relY, y=rect.width-relX
+      const cx = ry, cy = rect.width - rx;
+      const sx = (v.deviceW || rect.height) / rect.height;
+      const sy = (v.deviceH || rect.width) / rect.width;
+      return { x: Math.round(cx * sx), y: Math.round(cy * sy) };
+    }
+    const sx = (v.deviceW || rect.width) / rect.width;
+    const sy = (v.deviceH || rect.height) / rect.height;
+    return { x: Math.round(rx * sx), y: Math.round(ry * sy) };
+  };
+  let moved = false;
+  let pressed = false;
+  let pan = null;
+  const kbBlur = () => { const kb = document.getElementById('kb-input'); if (kb && document.activeElement === kb) kb.blur(); };
+  img.addEventListener('mousedown', async (e) => {
+    if (e.button !== 0) return;
+    e.preventDefault();
+    kbBlur();
+    img.focus({ preventScroll: true });
+    moved = false;
+    const p = toCdp(e);
+    if (g.z > 1) {
+      pan = { x: e.clientX, y: e.clientY, tx: g.tx, ty: g.ty };
+      img.style.cursor = 'grabbing';
+      return;
+    }
+    pressed = true;
+    try {
+      await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+    } catch (_) {}
+  });
+  img.addEventListener('mousemove', (() => {
+    let last = 0;
+    return async (e) => {
+      if (pan) {
+        const dx = e.clientX - pan.x, dy = e.clientY - pan.y;
+        if (Math.hypot(dx, dy) > 4) moved = true;
+        g.tx = pan.tx + dx;
+        g.ty = pan.ty + dy;
+        g.apply();
+        return;
+      }
+      const now = Date.now();
+      if (now - last < 60) return;
+      last = now;
+      moved = true;
+      const p = toCdp(e);
+      try { await cdpSend('Input.dispatchMouseEvent', { type: 'mouseMoved', x: p.x, y: p.y, button: pressed ? 'left' : 'none' }); } catch (_) {}
+    };
+  })());
+  const finishMouse = async (e) => {
+    if (pan) {
+      pan = null;
+      img.style.cursor = g.z > 1 ? 'grab' : '';
+      if (!moved) {
+        const p = toCdp(e);
+        try {
+          await cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+          await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+        } catch (_) {}
+      }
+      return;
+    }
+    if (!pressed) return;
+    pressed = false;
+    const p = toCdp(e);
+    try {
+      await cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: moved ? 0 : 1 });
+    } catch (_) {}
+  };
+  window.addEventListener('mouseup', finishMouse);
+  img.addEventListener('mouseleave', () => {
+    if (pan) { pan = null; img.style.cursor = g.z > 1 ? 'grab' : ''; }
+  });
+  img.addEventListener('wheel', async (e) => {
+    e.preventDefault();
+    if (e.ctrlKey) {
+      g.z = Math.min(5, Math.max(1, g.z * (e.deltaY < 0 ? 1.15 : 0.87)));
+      if (g.z === 1) { g.tx = 0; g.ty = 0; }
+      g.apply();
+      return;
+    }
+    const p = toCdp(e);
+    try { await cdpSend('Input.dispatchMouseEvent', { type: 'mouseWheel', x: p.x, y: p.y, button: 'none', deltaX: e.deltaX, deltaY: e.deltaY }); } catch (_) {}
+  }, { passive: false });
+  img.addEventListener('contextmenu', (e) => e.preventDefault());
+  // 触屏手势：轻点=点击，滑动=滚动，双指缩放，缩放后单指拖动，双击复位
+  const g = { z: 1, tx: 0, ty: 0, pts: new Map(), pinch0: 0, z0: 1, start: null, last: null, moved: false, lastTap: 0 };
+  g.apply = () => {
+    if (!isFinite(g.z) || g.z < 1) g.z = 1;
+    if (g.z > 5) g.z = 5;
+    if (!isFinite(g.tx) || g.z === 1) g.tx = 0;
+    if (!isFinite(g.ty) || g.z === 1) g.ty = 0;
+    img.style.transformOrigin = '0 0';
+    img.style.transform = (g.z === 1 && !g.tx && !g.ty) ? '' : `translate(${g.tx}px,${g.ty}px) scale(${g.z})`;
+    img.style.cursor = g.z > 1 ? 'grab' : '';
+    const zv = document.getElementById('v-zval');
+    if (zv) zv.textContent = Math.round(g.z * 100) + '%';
+  };
+  window._vgesture = g;
+  const pinchDist = () => {
+    const a = [...g.pts.values()];
+    return Math.hypot(a[0].clientX - a[1].clientX, a[0].clientY - a[1].clientY);
+  };
+  img.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    kbBlur();
+    // 用 e.touches 全量重建（权威数据），清除漏收 end 事件的残留触点
+    g.pts.clear();
+    for (const t of e.touches) g.pts.set(t.identifier, { x: t.clientX, y: t.clientY });
+    if (!isFinite(g.z) || g.z < 1) { g.z = 1; g.tx = 0; g.ty = 0; }
+    if (g.pts.size === 2) { g.pinch0 = pinchDist() || 1; g.z0 = g.z; g.start = null; }
+    else if (g.pts.size === 1) {
+      const t = e.changedTouches[0];
+      g.start = { x: t.clientX, y: t.clientY, t: Date.now() };
+      g.last = { x: t.clientX, y: t.clientY };
+      g.moved = false;
+    }
+  }, { passive: false });
+  img.addEventListener('touchmove', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) {
+      if (g.pts.has(t.identifier)) g.pts.set(t.identifier, { x: t.clientX, y: t.clientY });
+    }
+    if (g.pts.size >= 2) {
+      const d = pinchDist();
+      if (d > 0 && g.pinch0 > 0) g.z = Math.min(5, Math.max(1, g.z0 * d / g.pinch0));
+      g.apply();
+      return;
+    }
+    if (g.pts.size === 1 && g.start) {
+      const t = e.changedTouches[0];
+      const dx = t.clientX - g.last.x, dy = t.clientY - g.last.y;
+      if (!g.moved && Math.hypot(t.clientX - g.start.x, t.clientY - g.start.y) > 8) g.moved = true;
+      if (g.moved) {
+        if (g.z > 1) {
+          g.tx += dx; g.ty += dy; g.apply();
+        } else {
+          const p = toCdp(t);
+          cdpSend('Input.dispatchMouseEvent', { type: 'mouseWheel', x: p.x, y: p.y, button: 'none', deltaX: Math.round(-dx * 1.5), deltaY: Math.round(-dy * 1.5) }).catch(() => {});
+        }
+      }
+      g.last = { x: t.clientX, y: t.clientY };
+    }
+  }, { passive: false });
+  img.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    for (const t of e.changedTouches) g.pts.delete(t.identifier);
+    if (g.start && !g.moved && g.pts.size === 0) {
+      const dur = Date.now() - g.start.t;
+      if (dur < 400) {
+        const t = e.changedTouches[0];
+        if (Date.now() - g.lastTap < 300) {
+          g.z = 1; g.tx = 0; g.ty = 0; g.apply();
+          g.lastTap = 0;
+        } else {
+          const p = toCdp(t);
+          cdpSend('Input.dispatchMouseEvent', { type: 'mousePressed', x: p.x, y: p.y, button: 'left', clickCount: 1 }).catch(() => {});
+          cdpSend('Input.dispatchMouseEvent', { type: 'mouseReleased', x: p.x, y: p.y, button: 'left', clickCount: 1 }).catch(() => {});
+          g.lastTap = Date.now();
+        }
+      }
+    }
+    g.start = null;
+    if (g.pts.size < 2) g.pinch0 = 0;
+  }, { passive: false });
+  img.addEventListener('touchcancel', () => { g.pts.clear(); g.start = null; g.pinch0 = 0; });
+  // 键盘：桌面端直接把按键派发到页面
+  img.tabIndex = 0;
+  img.style.outline = 'none';
+}
+
+function keyModifiers(e) {
+  return (e.ctrlKey ? 2 : 0) | (e.altKey ? 1 : 0) | (e.shiftKey ? 8 : 0) | (e.metaKey ? 4 : 0);
+}
+
+document.addEventListener('keydown', async (e) => {
+  if (!state.current || state.view !== 'quick') return;
+  if (e.key === 'F5' || e.key === 'F11' || e.key === 'F12') return;
+  if (e.target && e.target.closest && e.target.closest('input,textarea,select')) return;
+  const img = document.getElementById('v-frame');
+  if (!img) return;
+  e.preventDefault();
+  const base = {
+    key: e.key,
+    code: e.code || undefined,
+    windowsVirtualKeyCode: e.keyCode,
+    nativeVirtualKeyCode: e.keyCode,
+    modifiers: keyModifiers(e),
+  };
+  const printable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+  try {
+    await cdpSend('Input.dispatchKeyEvent', printable ? { ...base, type: 'keyDown', text: e.key } : { ...base, type: 'keyDown' });
+    await cdpSend('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
+  } catch (_) {}
+});
+
+$('#v-url').addEventListener('keydown', async (e) => {
+  if (e.key !== 'Enter') return;
+  await navigateUrl();
+});
+
+async function navigateUrl() {
+  let url = $('#v-url').value.trim();
+  if (!url) return;
+  if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) url = 'https://' + url;
+  try {
+    await cdpSend('Page.navigate', { url });
+    rememberUrl(url);
+  } catch (err) { toast(err.message); }
+  imgFocus();
+}
+
+function urlHistKey() { return 'urlhist_' + (state.current || ''); }
+
+function rememberUrl(u) {
+  if (!u || u.startsWith('data:') || u === 'about:blank') return;
+  try {
+    const k = urlHistKey();
+    const arr = JSON.parse(localStorage.getItem(k) || '[]');
+    const i = arr.indexOf(u);
+    if (i >= 0) arr.splice(i, 1);
+    arr.unshift(u);
+    localStorage.setItem(k, JSON.stringify(arr.slice(0, 15)));
+    $('#urlhist').innerHTML = arr.slice(0, 15).map((x) => `<option value="${esc(x)}">`).join('');
+  } catch (_) {}
+}
+
+function loadUrlHist() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(urlHistKey()) || '[]');
+    $('#urlhist').innerHTML = arr.map((x) => `<option value="${esc(x)}">`).join('');
+  } catch (_) {}
+}
+
+/* 移动端查看器工具条 */
+// 缩放：以视口为中心缩放，支持 ± 按钮与捏合
+function zoomBy(f) {
+  const g = window._vgesture;
+  if (!g) return;
+  const vp = $('#vport').getBoundingClientRect();
+  const cx = vp.width / 2, cy = vp.height / 2;
+  let nz = g.z * f;
+  if (!isFinite(nz)) nz = 1;
+  nz = Math.min(5, Math.max(1, nz));
+  g.tx = cx - (cx - g.tx) * (nz / g.z);
+  g.ty = cy - (cy - g.ty) * (nz / g.z);
+  g.z = nz;
+  g.apply();
+}
+$('#v-zin').addEventListener('click', () => zoomBy(1.3));
+$('#v-zout').addEventListener('click', () => zoomBy(1 / 1.3));
+
+$('#v-go').addEventListener('click', navigateUrl);
+
+$('#kb-input').addEventListener('input', (e) => {
+  if (e.inputType === 'insertText' && e.data) {
+    cdpSend('Input.insertText', { text: e.data }).catch(() => {});
+  }
+  e.target.value = '';
+});
+
+$('#kb-input').addEventListener('keydown', async (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    const base = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
+    try {
+      await cdpSend('Input.dispatchKeyEvent', { type: 'keyDown', ...base });
+      await cdpSend('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+    } catch (_) {}
+    e.target.value = '';
+  } else if (e.key === 'Backspace') {
+    e.preventDefault();
+    const base = { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 };
+    try {
+      await cdpSend('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...base });
+      await cdpSend('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+    } catch (_) {}
+  }
+});
+
+$('#v-fs').addEventListener('click', () => {
+  if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }
+  const el = $('#viewer');
+  if (el.requestFullscreen) el.requestFullscreen().catch(() => toast('全屏失败'));
+});
+
+$('#v-q').addEventListener('change', () => {
+  const v = state.viewer;
+  if (v.mode === 'poll') { toast('兼容模式下画质固定'); return; }
+  if (v.ws && v.ws.readyState === 1) {
+    v.ws.send(JSON.stringify({ id: v.msgId++, method: 'Page.startScreencast', params: castParams() }));
+    toast('画质已切换');
+  }
+});
+
+function imgFocus() { const img = $('#v-frame'); if (img) img.focus(); }
+
+$('#v-back').addEventListener('click', () => navHistory(-1));
+$('#v-fwd').addEventListener('click', () => navHistory(1));
+$('#v-reload').addEventListener('click', async () => {
+  const v = state.viewer;
+  try {
+    await cdpSend('Page.reload', { ignoreCache: false });
+  } catch (e) {
+    // 崩溃/冻结目标 reload 失败：回退到上次已知地址重新导航（OAuth state 参数保留，流程可续）
+    const url = (v.targetId && v.lastUrls[v.targetId]) || $('#v-url').value.trim();
+    if (url) {
+      try {
+        await cdpSend('Page.navigate', { url });
+        toast('页面已崩溃，已按原地址重新打开');
+      } catch (e2) { toast('刷新失败：' + (e2.message || e.message), 4000); }
+    } else {
+      toast('刷新失败：' + (e.message || '目标已崩溃且无地址可恢复'), 4000);
+    }
+  }
+  imgFocus();
+});
+
+async function navHistory(delta) {
+  try {
+    const hist = await cdpSend('Page.getNavigationHistory', {});
+    const idx = hist.currentIndex + delta;
+    const entry = hist.entries && hist.entries[idx];
+    if (!entry) return;
+    await cdpSend('Page.navigateToHistoryEntry', { entryId: entry.id });
+    imgFocus();
+  } catch (e) { toast(e.message); }
+}
+
+/* ---------- 代理库 ---------- */
+async function loadProxies() {
+  try {
+    const body = await api('/api/console/proxies/list');
+    const list = (body.data && body.data.list) || [];
+    $('#px-table').innerHTML = `<tr><th>#</th><th>名称</th><th>代理</th><th>类型</th><th>最近检测</th><th>操作</th></tr>`
+      + (list.length ? list.map((p, i) => `<tr>
+          <td>${i + 1}</td>
+          <td>${esc(p.name || p.proxy_name || '-')}</td>
+          <td style="word-break:break-all">${esc(p.proxy_summary || p.raw_summary || p.raw || p.host || '-')}</td>
+          <td>${esc(p.type || p.proxy_type || '-')}</td>
+          <td>${esc(p.last_check && (p.last_check.exit_ip || p.last_check.status) || '-')}</td>
+          <td><div class="seg"><button data-px="check" data-id="${esc(p.proxy_id || p.id)}">检测</button><button data-px="del" data-id="${esc(p.proxy_id || p.id)}">删除</button></div></td>
+        </tr>`).join('') : '<tr><td colspan="6" class="muted">暂无代理</td></tr>');
+  } catch (e) { toast(e.message); }
+}
+
+$('#px-reload').addEventListener('click', loadProxies);
+$('#px-new').addEventListener('click', async () => {
+  const raw = prompt('输入代理（http://user:pass@host:port 或 socks5://host:port，Direct 表示直连）');
+  if (!raw) return;
+  try {
+    await api('/api/console/proxies/create', { method: 'POST', body: JSON.stringify({ name: raw.split('@').pop() || 'proxy', proxy: raw, raw }) });
+    toast('代理已添加');
+    loadProxies();
+  } catch (e) { toast(e.message); }
+});
+
+$('#px-table').addEventListener('click', async (e) => {
+  const btn = e.target.closest('button[data-px]');
+  if (!btn) return;
+  const id = btn.dataset.id;
+  btn.disabled = true;
+  try {
+    if (btn.dataset.px === 'del') {
+      if (!confirm('确认删除该代理？')) { btn.disabled = false; return; }
+      await api('/api/console/proxies/delete', { method: 'POST', body: JSON.stringify({ proxy_ids: [id] }) });
+      toast('已删除');
+    } else {
+      btn.textContent = '检测中';
+      const r = await api('/api/console/proxies/check', { method: 'POST', body: JSON.stringify({ proxy_id: id }) });
+      toast('检测结果：' + JSON.stringify(r.data).slice(0, 120));
+    }
+  } catch (err) { toast(err.message); }
+  loadProxies();
+});
+
+/* ---------- 日志 ---------- */
+document.querySelectorAll('#log-seg button').forEach((b) => b.addEventListener('click', () => {
+  state.logSrc = b.dataset.src;
+  document.querySelectorAll('#log-seg button').forEach((x) => x.classList.toggle('active', x === b));
+  loadLogs();
+}));
+$('#log-reload').addEventListener('click', loadLogs);
+
+async function loadLogs() {
+  const body = $('#log-body');
+  try {
+    if (state.logSrc === 'guard') {
+      const ev = (await api('/api/console/guard/events?limit=100')).data.events;
+      const GUARD_LABELS = { 'guard-trigger': '守护触发（资源超限，保护性处置）', 'guard-error': '守护异常' };
+      body.innerHTML = ev.length ? ev.map((e2) => `<div class="event ${e2.kind === 'guard-trigger' ? 'danger' : ''}"><b>${esc(GUARD_LABELS[e2.kind] || e2.kind)}</b> · 实例 ${esc(e2.profileId || '')} · ${esc(e2.rule || e2.error || '')}${e2.metrics ? ` · 内存 ${e2.metrics.rssMb}MB / CPU ${e2.metrics.cpuPct}% / 进程 ${e2.metrics.procs}` : ''}${e2.result ? ` · 处置 ${esc(e2.result)}` : ''}</div>`).join('') : '<div class="muted">暂无守护事件</div>';
+    } else if (state.logSrc === 'op') {
+      const ops = (await api('/api/console/oplog')).data.ops;
+      const OP_LABELS = {
+        'opsbox-sso': '打开运维管理（免密单点登录）',
+        'batch-create': '批量新建实例',
+        'import': '导入实例配置',
+        'export': '导出实例配置',
+        'delete': '删除实例',
+        'hang-unpaused': '页面冻结 → 已自动解冻恢复（登录态保留）',
+        'hang-detected': '页面冻结 → 解冻无效，已记录进程现场（未关闭页面，可停止/启动该实例恢复）',
+        'keeper-mark-failed': '守护标记写入失败 → 停止后的实例仍会被自动拉起（需修复 keeper-state.json 权限）',
+      };
+      const OP_KEYS = { profileId: '实例', targetId: '窗口', url: '页面', count: '数量', ok: '成功', total: '总数', id: '实例' };
+      const fmtVal = (k, v) => k === 'url' ? String(v).slice(0, 60) : (typeof v === 'object' && v !== null ? JSON.stringify(v) : String(v));
+      body.innerHTML = ops.length ? ops.map((o) => {
+        const label = OP_LABELS[o.kind] || o.kind;
+        const detail = Object.entries(o).filter(([k]) => !['ts', 'kind'].includes(k))
+          .map(([k, v]) => `${OP_KEYS[k] || k}=${esc(fmtVal(k, v))}`).join(' · ');
+        return `<div class="event"><b>${new Date(o.ts).toLocaleTimeString()}</b> · ${esc(label)}${detail ? ' · ' + detail : ''}</div>`;
+      }).join('') : '<div class="muted">暂无操作日志</div>';
+    } else {
+      body.innerHTML = '<div class="muted">刷新错误记录于 /home/openbrowser/.config/openbrowser/logs/refresh-errors.log（可通过运维管理·文件管理查看）</div>';
+    }
+  } catch (e) { body.innerHTML = `<div class="muted">${esc(e.message)}</div>`; }
+}
+
+/* ---------- 其他 ---------- */
+$('#btn-ops-newtab').addEventListener('click', () => window.open('/opsbox/', '_blank'));
+
+async function boot() {
+  if (window.innerWidth <= 768) $('#sidebar').classList.add('collapsed');
+  await loadStatus();
+  await loadProfiles();
+  clearInterval(state._poll);
+  state._poll = setInterval(() => { loadStatus(); loadProfiles(); }, 5000);
+}
+
+if (state.token) {
+  boot().catch(() => showLogin());
+} else {
+  showLogin();
+}
+</script>
+</body>
+</html>

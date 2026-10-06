@@ -1,17 +1,19 @@
 <div align="center">
 
-<img src="./assets/openbrowser-title.svg" alt="OpenBrowser" width="820">
+# changBrowser
 
-[![Version](https://img.shields.io/badge/version-1.0.23-blue)](https://github.com/sheying2013/OpenBrowser)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Ubuntu-lightgrey)](https://github.com/sheying2013/OpenBrowser)
-[![License](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
-[![Node](https://img.shields.io/badge/Node.js-LTS-339933.svg)](https://nodejs.org/)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Platform](https://img.shields.io/badge/platform-Linux%20(Ubuntu%20x86__64)-lightgrey)
+![Node](https://img.shields.io/badge/Node.js-LTS-339933)
+![Runtime](https://img.shields.io/badge/Electron%20%2B%20Python-runtime-blue)
 
-**多国语言支持 / Multi-language support**
+**面向隔离 Chromium 环境的远程 Web 控制台**
 
-🇺🇸 [English](./README.md) · 🇨🇳 **中文**
+基于 [OpenBrowser](https://github.com/sheying2013/OpenBrowser) 构建的自托管控制面：
+在浏览器里集中管理、实时查看并操作多套隔离的 Chromium 实例，配套全链路守护
+`keeper`、实例资源护栏 `guard` 与运维工作台 `opsbox`。
 
-**本地指纹浏览器 · 隔离 Chromium 环境 · 代理 / 指纹 / 同步 / RPA**
+[English](./README.md) | [中文](./README_CN.md)
 
 </div>
 
@@ -19,167 +21,159 @@
 
 ## 简介
 
-OpenBrowser 是一款本地桌面指纹浏览器，用于管理多套互相隔离的 Chromium 环境。它把 Profile 隔离、代理配置、浏览器指纹参数、扩展管理、窗口同步、本地 API、MCP 集成和本地 RPA 流程集中在一个桌面应用里。
+changBrowser 保留 OpenBrowser 的底座（隔离 Chromium Profile、代理、指纹、扩展与
+RPA 模块），并在此基础上增加了一个**远程 Web 控制台**，让一台 Linux 服务器可以
+无人值守地运行多套浏览器环境。
 
-应用支持多国语言界面，目前包含英文和中文。
+全部操作都可以在浏览器里完成：
 
-> 使用前请阅读 [免责声明](./DISCLAIMER.md)。OpenBrowser 不保证匿名、指纹唯一或对特定网站的兼容性。
+- **Web 控制台**（端口 `50327`）——实例列表、启停、实时画面、多标签与地址栏、定时刷新、
+  代理库、中文操作日志，以及免密嵌入的 opsbox。
+- **画面通道**——通过 WebSocket 桥接 CDP `Page.startScreencast`。当运营商或网关拦截
+  WSS 升级时，查看器自动降级为 `1s` 轮询截图 + REST 指令，并每 `15s` 试探 WSS 自动切回。
+- **keeper**——全链路守护：让 Xvfb、桌面客户端、控制台、opsbox 与期望实例存活
+  （实例死亡 `15s` 内复活，检测 CDP 健康，实例内存总和逼近主机上限时终止失控实例）。
+- **guard**——按实例的应急资源刹车（RSS / CPU / 增速 / 进程数）。阈值刻意设高
+  （`rssLimitMb: 4096`），只强停真正失控的实例，日常上限由 keeper 内存守护承担。
+- **opsbox**——运维工作台：CPU / 内存 / 网络 / 磁盘实时曲线、按实例名标注的进程表、
+  内存清理与文件管理。
 
-## 目录
-
-- [界面预览](#界面预览)
-- [核心功能](#核心功能)
-- [支持平台](#支持平台)
-- [快速开始](#快速开始)
-- [打包](#打包)
-- [自测](#自测)
-- [项目结构](#项目结构)
-- [数据与安全](#数据与安全)
+> 基于 OpenBrowser（MIT）。参见 [与上游的关系](#与上游的关系) 与 [免责声明](./DISCLAIMER.md)。
 
 ## 界面预览
 
-| 主界面 | 环境管理 |
+| 画面通道 | 实例管理 |
 | :---: | :---: |
-| ![主界面](./docs/screenshots/openbrowser-overview.png) | ![环境管理](./docs/screenshots/environment-management.png) |
-| 主导航与模块入口 | Profile 列表、启停控制、分组 |
+| ![画面通道](./docs/screenshots/changbrowser-console-viewer.png) | ![实例管理](./docs/screenshots/changbrowser-console-quick.png) |
+| 实时浏览器画面、多标签、地址栏、画质与定时刷新 | Profile 列表、实时状态、单实例操作 |
 
-| 环境 / 指纹编辑 | 本地设置 |
+| 操作日志 | 运维工作台（opsbox） |
 | :---: | :---: |
-| ![环境编辑](./docs/screenshots/profile-fingerprint-editor.png) | ![本地设置](./docs/screenshots/automation-and-system.png) |
-| 代理、指纹、扩展设置 | 主题、语言、系统选项 |
+| ![操作日志](./docs/screenshots/changbrowser-console-logs.png) | ![运维工作台](./docs/screenshots/changbrowser-opsbox-resource.png) |
+| 页面冻结 / 解冻、恢复、导出等事件（中文） | CPU / 内存 / 网络 / 磁盘曲线与进程标签 |
 
-## 核心功能
+| 桌面端 · 环境管理 |
+| :---: |
+| ![桌面端](./docs/screenshots/environment-management.png) |
+| 承载 Local API 的 Electron 客户端 |
+
+## 核心能力
 
 | 模块 | 能力 |
 | --- | --- |
-| **环境隔离** | 独立 Chromium Profile，Cookie / 缓存 / 存储互不混用。 |
-| **批量管理** | 分组、标签、批量启停、日志和窗口尺寸管理。 |
-| **代理支持** | HTTP / HTTPS / SOCKS 代理，按环境绑定，支持出口检测。 |
-| **指纹参数** | 平台、语言、时区、UA、Canvas、WebGL、WebRTC 等参数。 |
-| **扩展中心** | 内置 / 推荐 / 本地扩展，按环境加载。 |
-| **窗口同步** | 基于 CDP 同步点击、滚动、输入和标签页。 |
-| **本地 RPA** | 打开页面、等待、点击、输入、截图等流程任务。 |
-| **Local API / MCP** | 默认本地集成端点为 `127.0.0.1:50325`。 |
-| **独立内核** | 可下载独立 Chromium 内核，也可指定本地路径。 |
-| **备份选项** | 本地、WebDAV、GitHub、网盘备份，仅在主动配置后启用。 |
+| **实例管理** | 列表、新建、批量创建、导入 / 导出、启停、删除、分组与搜索。 |
+| **画面通道** | CDP screencast over WebSocket；HTTP 轮询自动兜底；`12s` 应用层心跳。 |
+| **标签与导航** | 多标签查看、地址栏、前进后退，以及「刷新此页」（冻结或崩溃目标按上次已知 URL 重新导航）。 |
+| **渲染看门狗** | 每 `30s` 探测各页面；冻结页面原地解冻以保留登录态，绝不关页重建；现场写入 `logs/freeze-forensics.log`。 |
+| **定时刷新** | 窗口级配置优先、实例级兜底；服务端 `Page.reload` 执行，与查看器是否打开无关；连续失败 3 次熔断。 |
+| **代理库** | 按环境绑定 HTTP / HTTPS / SOCKS 代理，支持出口检测。 |
+| **指纹参数** | 平台、语言、时区、UA、Canvas、WebGL、WebRTC，以及随机人设生成。 |
+| **操作日志** | 中文操作日志、守护事件与刷新错误视图。 |
+| **运维工作台** | 免密 SSO 嵌入 opsbox；资源曲线与进程表。 |
+| **全链路守护** | keeper 复活 Xvfb / 客户端 / 控制台 / opsbox / 期望实例，并做内存守护。 |
+| **资源护栏** | guard 防止单个实例拖垮主机（RSS / CPU / 增速 / 进程数）。 |
 
-## 支持平台
+## 架构
 
-| 平台 | 架构 | 状态 |
+```mermaid
+graph TD
+  User["浏览器 / 手机"] --> Console["Web 控制台 :50327"]
+  Console --> LocalAPI["Local API :50325"]
+  Console --> Opsbox["opsbox :8002"]
+  Console --> Bridge["ws-bridge（CDP screencast）"]
+  LocalAPI --> Instances["隔离 Chromium 实例"]
+  Bridge --> Instances
+  Keeper["keeper 守护"] --> Console
+  Keeper --> Opsbox
+  Keeper --> Instances
+  Guard["guard 资源护栏"] --> Instances
+  Refresher["refresher 定时刷新"] --> Instances
+```
+
+| 服务 | 监听 | 说明 |
 | --- | --- | --- |
-| Windows | x86_64 | ✅ 支持 |
-| macOS | x86_64 | ✅ 支持 |
-| macOS | arm64 | ✅ 支持 |
-| Ubuntu | x86_64 | ✅ 支持 |
+| Local API | `127.0.0.1:50325` | 桌面客户端内置，`api-key` 认证。 |
+| 桌面启动页 | `127.0.0.1:50326` | Electron 启动页，token 认证。 |
+| Web 控制台 | `0.0.0.0:50327` | 口令登录，实例 / 画面 / 日志 / 运维管理。 |
+| opsbox | `0.0.0.0:8002` | 口令登录，或由控制台免密 SSO。 |
 
-## 快速开始
+## 快速开始（Ubuntu x86_64）
 
-需要 Node.js LTS 和 npm。
+依赖：Node.js LTS、Python 3、Xvfb，以及标准 Electron / Chromium 桌面库。
 
 ```bash
+# 安装依赖
 cd Browserapp
 npm ci --include=dev
-npm run selftest
-npm start
-```
 
-也可以从仓库根目录使用启动脚本：
-
-| 平台 | 启动脚本 |
-| --- | --- |
-| macOS | [`start-test.command`](./start-test.command) |
-| Windows | [`start-test.cmd`](./start-test.cmd) |
-| Ubuntu | [`start-test.sh`](./start-test.sh) |
-
-## 打包
-
-```bash
-cd Browserapp
-# 可选：OPENBROWSER_PACKAGE_ARCH=x86_64 或 arm64
-# 仅 Ubuntu x86_64：显式获取 Chrome for Testing 内核种子。
+# 获取 Electron / Chromium 运行时与 Linux 内核
+node node_modules/desktop-shell/install.js
 npm run prepare:linux-kernel
-npm run package:portable
+
+# 运行控制台自测
+npm run selftest:webconsole
 ```
 
-构建产物输出到 `Browserapp/dist/`。
-
-| 平台 | 产物说明 |
-| --- | --- |
-| Windows | 包含 `START.cmd`。 |
-| macOS | 包含 `OpenBrowser.app` 和 `启动.command`。 |
-| Ubuntu x86_64 | 包含 `OpenBrowser-…tar.gz` 便携包和启动器。 |
-
-Ubuntu 安装包将 Chrome for Testing 内置在
-`kernels/chrome-for-testing/chrome-linux64`；应用运行时不会下载内核。请用普通桌面用户运行，不要使用 `sudo`。如缺少依赖，可安装标准 Electron/Chromium 桌面库：
+启动整套服务。`keeper.js` 以 root 运行，负责守护包括 `Xvfb :99`、桌面客户端、
+控制台（`50327`）与 opsbox（`8002`）在内的所有组件：
 
 ```bash
-sudo apt-get install libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcups2 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2
+# 守护进程（root）。它会拉起并复活其余组件。
+node Browserapp/webconsole/keeper.js
 ```
 
-## 自测
+桌面客户端拒绝以 root 运行，必须以桌面用户启动：
 
 ```bash
-cd Browserapp
-npm run selftest
-npm run selftest:automation
-npm run selftest:protocol
-npm run selftest:isolation
-npm run selftest:kernel
-npm run selftest:cloud
+setpriv --reuid=1000 --regid=1000 --clear-groups \
+  env HOME=/home/openbrowser USER=openbrowser LOGNAME=openbrowser DISPLAY=:99 \
+  ELECTRON_DISABLE_SANDBOX=1 node Browserapp/scripts/run-app.js
 ```
 
 ## 项目结构
 
 ```text
-OpenBrowser/
-├── Browserapp/            # 应用源码
-├── docs/screenshots/      # 截图
-├── start-test.command     # macOS 启动脚本
-├── start-test.cmd         # Windows 启动脚本
-├── start-test.sh          # Ubuntu 启动脚本
+changBrowser/
+├── Browserapp/
+│   ├── engine.js                 # 实例启动与 Chromium 参数组装
+│   ├── main.js                   # Electron 主进程
+│   ├── automation/               # Local API 与 RPA
+│   └── webconsole/
+│       ├── server.js             # Web 控制台 HTTP/WS 服务（:50327）
+│       ├── keeper.js             # 全链路守护
+│       ├── guard.js              # 单实例资源护栏
+│       ├── refresher.js          # 定时刷新调度器
+│       ├── ws-bridge.js          # 零依赖 CDP screencast WS 桥
+│       ├── fingerprint.js        # 随机指纹人设生成器
+│       └── public/index.html     # 控制台界面
+├── opsbox/
+│   ├── app.py                    # 运维工作台（FastAPI，:8002）
+│   └── index.html                # opsbox 界面
+├── docs/screenshots/             # 截图
 ├── DISCLAIMER.md
 ├── LICENSE
-├── README.md              # 英文说明
-└── README_CN.md           # 中文说明
+└── README.md / README_CN.md
 ```
 
-仓库只包含源码与文档，不包含 Profile、Cookie、代理凭据、打包用内核二进制或安装包。官方 Windows x64 和 macOS arm64 构建会在 CI 打包时集成对应 Wayfern 内核；macOS x86_64 构建使用 OpenBrowser 148 内核；Ubuntu x86_64 构建会在 CI 打包时显式获取 Chrome for Testing。
+仓库只包含源码与文档，不包含 Profile、Cookie、代理凭据、打包用内核二进制或安装包。
 
 ## 数据与安全
 
-- 本地 API 默认只监听回环地址。
-- 设置 `OPENBROWSER_API_KEY` 后，请求必须携带 `api-key` 头。
-- 浏览器启动失败会追加写入用户 OpenBrowser 数据目录下的本地 `browser-startup.log`。在 `Browserapp/` 执行 `npm run log:startup` 可直接读取；日志已被 Git 忽略。
-- 第三方组件声明见 [`THIRD-PARTY-NOTICES.md`](./Browserapp/THIRD-PARTY-NOTICES.md)。
+- Local API 仅监听回环；设置 `OPENBROWSER_API_KEY` 后请求必须携带 `api-key` 头。
+- 控制台与 opsbox 口令来自 `CONSOLE_PASSWORD` / `OPS_PASSWORD`，或
+  `<userData>/console-password.txt`，不写入仓库。
+- Web 控制台与 opsbox 监听 `0.0.0.0` 供远程访问，请使用强口令保护；登录已做失败限流。
+- 运行日志位于 `<userData>/logs/`（`console-ops.log`、守护事件、`freeze-forensics.log`、
+  `refresh-errors.log`）。
 - 云备份集成只有在用户显式配置后才会主动联网。
 
-## 文档
+## 与上游的关系
 
-- [自动化模块](./Browserapp/automation/README.md)
-- [免责声明](./DISCLAIMER.md)
-- [第三方组件声明](./Browserapp/THIRD-PARTY-NOTICES.md)
-
----
-
-<details>
-<summary>第三方内核来源</summary>
-
-<br>
-
-独立内核来自 [Donut Browser](https://github.com/zhom/donutbrowser) / [Wayfern](https://wayfern.com/)（作者 [zhom](https://github.com/zhom)）。更新源：[wayfern.json](https://donutbrowser.com/wayfern.json)。条款：[Wayfern ToS](https://wayfern.com/tos)。
-
-仓库不保存内核二进制。官方平台包会在 CI 打包时从官方源获取对应 Wayfern 内核；macOS x86_64 包使用已纳入源码的 OpenBrowser 148 运行时。
-
-</details>
+changBrowser 是 [OpenBrowser](https://github.com/sheying2013/OpenBrowser) 的下游定制。
+桌面应用、内核管理、指纹与代理模块来自上游；远程 Web 控制台、画面通道、`keeper`、
+`guard`、`refresher`、`ws-bridge` 与 `opsbox` 为本仓库新增。
 
 ## 许可证
 
-[MIT](./LICENSE)
-
----
-
-<div align="center">
-
-如果 OpenBrowser 对你有用，欢迎 Star ⭐
-
-</div>
+[MIT](./LICENSE)。OpenBrowser 及其第三方声明见
+[`Browserapp/THIRD-PARTY-NOTICES.md`](./Browserapp/THIRD-PARTY-NOTICES.md)。

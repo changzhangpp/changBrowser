@@ -102,6 +102,16 @@ This file records user instructions, preferences, and teachings for reference in
 - .gitignore 排除 Browserapp/kernels/chrome-stable（437M 下载内核）及 **/.secret、**/console-password.txt、**/local-api-key.txt
 
 [Project Knowledge Summary]
+- Date: 2026-10-06
+- Context: 为 changBrowser README 拍摄真实页面截图（控制台/opsbox/画面通道）
+- Category: Build Methods / Troubleshooting & Debugging
+- Instructions:
+  - 低内存截图方法（比 Electron 离屏更轻，不需 X）：用 kernels/chrome-stable 的 chrome `--headless=new --no-sandbox --remote-debugging-port=<p> --user-data-dir=/tmp/...`，CDP `Runtime.evaluate` 写 `localStorage.console_token`（控制台）或 `localStorage.ops_token`（opsbox）后 reload，再 `Page.captureScreenshot`
+  - 控制台登录 POST /api/console/login {password}；opsbox 登录 POST /api/login {password}（同一口令 console-password.txt）
+  - opsbox init() 启动缺陷已修复（2026-10-06）：原带 token 启动时不调 resStart()，资源页停留占位符「—」；现 init 无条件 `switchTab(t0, true)`，由 switchTab 统一 `resRefresh()+resStart()`（opsbox/index.html 每次请求重读，改完即生效，无需重启）
+  - 画面通道截图：POST /api/console/profiles/<id>/targets {action:'new',url} 开临时标签 → 前端 openViewer(id) 后 click `.tab[data-id]` → 截图 → {action:'close',targetId} 还原；实例内容有隐私风险时用公开页面做临时标签
+
+[Project Knowledge Summary]
 - Date: 2026-10-05
 - Context: 实现窗口级定时刷新与查看器倒计时
 - Category: Troubleshooting & Debugging / Workflow & Collaboration

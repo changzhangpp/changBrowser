@@ -770,7 +770,7 @@ async function doLogin(){
 /* ---- 启动：探测 token，有效则按 hash 进对应页；401 弹登录 ---- */
 (async function init(){
   const t0 = location.hash === '#files' ? 'files' : 'res';
-  if(t0 !== activeTab) switchTab(t0, true);
+  switchTab(t0, true);
   if(!token){ showLogin(); return; }
   try{
     await api('/api/stats');

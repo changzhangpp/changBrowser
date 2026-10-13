@@ -233,6 +233,18 @@ async function main() {
   assert.strictEqual(decorated[1].refresh.source, 'instance', '未设置窗口继承实例级配置');
   refresher.clearWindowConfig('p1', 'ws://cdp/a');
 
+  // 浏览器重启后按 URL 领养窗口配置
+  refresher.setWindowConfig('p1', 'old-tab', { intervalSec: 30, enabled: true });
+  refresher.syncWindows('p1', [{ id: 'old-tab', url: 'https://x/task/1' }]);
+  refresher.syncWindows('p1', [{ id: 'new-tab', url: 'https://x/task/1' }]); // 模拟重启换 targetId
+  const adopted = refresher.windowState('p1', 'new-tab', 0, true);
+  assert.strictEqual(adopted.source, 'window', '重启后按 URL 领养窗口配置');
+  assert.strictEqual(adopted.intervalSec, 30, '领养配置保留间隔');
+  const persisted = JSON.parse(fs.readFileSync(refConfigFile, 'utf8'));
+  assert.strictEqual(persisted.p1.windows['new-tab'].intervalSec, 30, '领养结果落盘');
+  assert.deepStrictEqual(persisted.p1.staleWindows, {}, '领养后归档清空');
+  refresher.clearWindowConfig('p1', 'new-tab');
+
   // 熔断：连续失败 3 次
   const errLog = path.join(TMP, 'refresh-errors.log');
   let retryClock = 100000;

@@ -8,6 +8,8 @@
 //       'all'    实例级默认应用到全部窗口
 //       'active' 实例级默认仅应用到活动窗口（/json/list 首个 page）
 // 每个窗口独立计时（nextFireAt），连续失败 3 次熔断该实例调度并写错误日志。
+// 浏览器重启后 targetId 全部变化：存活期间记录各窗口 URL，死亡时按 URL 归档，
+// 新 targetId 出现时按 URL 领养历史窗口配置（syncWindows），设置不因重启丢失。
 
 const fs = require('fs');
 const path = require('path');
@@ -16,6 +18,7 @@ const http = require('http');
 const ACTIVE_POLL_MS = 5000;
 const TICK_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
+const MAX_STALE_WINDOWS = 50; // 按 URL 归档的历史窗口配置上限，防止无限增长
 
 function loadJson(file, fallback) {
   try {
@@ -141,6 +144,7 @@ class Refresher {
     const next = {
       intervalSec: intervalSec === undefined ? (cur.intervalSec || 0) : Math.max(0, Number(intervalSec) || 0),
       enabled: enabled === undefined ? (cur.enabled === undefined ? true : cur.enabled) : Boolean(enabled),
+      url: cur.url, // 保留 URL 供重启后领养；缺失时由 syncWindows 在下一轮补记
     };
     if (next.enabled && next.intervalSec > 0 && next.intervalSec < 5) next.enabled = false;
     cfg.windows[targetId] = next;
@@ -270,6 +274,7 @@ class Refresher {
       } catch (_) {
         continue;
       }
+      this.syncWindows(profileId, pages);
       for (let i = 0; i < pages.length; i++) {
         const target = pages[i];
         const st = this.windowState(profileId, target.id, i, true);
@@ -329,6 +334,48 @@ class Refresher {
     const prefix = `${profileId}|`;
     for (const key of [...this.lastFire.keys()]) {
       if (key.startsWith(prefix) && !live.has(key.slice(prefix.length))) this.lastFire.delete(key);
+    }
+    if (dirty) {
+      this.configs[profileId] = cfg;
+      if (this.configFile) saveJson(this.configFile, this.configs);
+    }
+  }
+
+  // 同步窗口配置与存活目标（浏览器重启后 targetId 全变，配置按 URL 迁移）：
+  //   1) 给存活窗口记录当前 URL
+  //   2) 已消失窗口的配置按 URL 归档进 staleWindows（上限 MAX_STALE_WINDOWS）
+  //   3) 新出现的 targetId 按 URL 领养归档配置
+  syncWindows(profileId, pages) {
+    const cfg = this.getConfig(profileId);
+    const list = Array.isArray(pages) ? pages : [];
+    let dirty = false;
+    cfg.windows = cfg.windows || {};
+    const live = new Set();
+    for (const t of list) {
+      live.add(t.id);
+      const w = cfg.windows[t.id];
+      if (w && t.url && w.url !== t.url) { w.url = t.url; dirty = true; }
+    }
+    for (const tid of Object.keys(cfg.windows)) {
+      if (live.has(tid)) continue;
+      const w = cfg.windows[tid];
+      if (w && w.url) {
+        cfg.staleWindows = cfg.staleWindows || {};
+        cfg.staleWindows[w.url] = { intervalSec: w.intervalSec || 0, enabled: w.enabled !== false };
+        const keys = Object.keys(cfg.staleWindows);
+        while (keys.length > MAX_STALE_WINDOWS) delete cfg.staleWindows[keys.shift()];
+      }
+      delete cfg.windows[tid];
+      dirty = true;
+    }
+    for (const t of list) {
+      if (!t.url || cfg.windows[t.id]) continue;
+      const saved = cfg.staleWindows && cfg.staleWindows[t.url];
+      if (saved) {
+        cfg.windows[t.id] = { intervalSec: saved.intervalSec || 0, enabled: saved.enabled !== false, url: t.url };
+        delete cfg.staleWindows[t.url];
+        dirty = true;
+      }
     }
     if (dirty) {
       this.configs[profileId] = cfg;

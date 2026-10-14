@@ -139,3 +139,16 @@ This file records user instructions, preferences, and teachings for reference in
    - 查看器看门狗区分"链路死"与"页面静"：watch 定时器发 Runtime.evaluate 探活（lastCdp），只有帧和 CDP 双双超时才断连重连，静态页面不再循环断开
    - keeper 自动纳管所有在运行实例（含桌面客户端启动的），写入 keeper-state.json；控制台 stop 会显式置 false 不复活
    - 实例卡片已有启动/停止按钮；stop 后 keeper 不再拉起，等用户手动 start
+
+[Project Knowledge Summary]
+- Date: 2026-10-14
+- Context: 重启 webconsole 与 opsbox 并纳入后台终端规范管理
+- Category: Operations & Deployment / Troubleshooting & Debugging
+- Instructions:
+  - webconsole 启动必须带 `HOME=/home/openbrowser OPENBROWSER_USER_DATA=/home/openbrowser/.config/openbrowser`（或以 openbrowser 家目录为 HOME），否则以 root 运行时读到 `/root/.config/openbrowser` 另一套配置：口令 401、local-api-key MISSING、日志/刷新配置全部落错位置
+  - opsbox 启动必须 cd 到 opsbox 目录（uvicorn 按 cwd 找 app.py）；口令解析顺序为 OPS_PASSWORD 等环境变量 → console-password.txt（含 /home/openbrowser 硬编码候选）→ change-me；.secret 用于 ops_token 签发，删除即全体 token 失效
+  - 两服务的口令都是启动时读一次并缓存，改 console-password.txt 后必须重启两个服务才生效
+  - 服务间认证头不同：控制台 `x-console-token`（或 console_token cookie），opsbox `x-auth-token`；运维管理免密链路 = 控制台把 console_token 通过 `/opsbox/?console_token=` 传给 opsbox 页面，由其 ssoLogin() 调 `/opsbox/sso-token` 换 ops_token（30 天）
+  - 当前托管终端：webconsole=term_1791990641204_26（限 796MB/0.5 核/256fd），opsbox=term_1791990880756_28；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
+  - 登录防爆破：两侧都是 60 秒窗口内错 10 次即锁 60 秒，期间正确密码也返回 429「尝试过于频繁」，排查时先区分 401 与 429
+  - 浏览器重启会换掉全部 targetId；窗口刷新配置自 2026-10-13 起按 URL 归档/领养（refresher syncWindows），重启不再丢刷新设置

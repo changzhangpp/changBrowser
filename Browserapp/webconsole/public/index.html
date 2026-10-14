@@ -448,6 +448,7 @@ document.querySelectorAll('#topnav button').forEach((b) => b.addEventListener('c
   ['quick', 'proxies', 'logs', 'ops'].forEach((v) => $('#view-' + v).classList.toggle('hidden', v !== state.view));
   if (state.view === 'proxies') loadProxies();
   if (state.view === 'logs') loadLogs();
+  if (state.view === 'ops') loadOpsFrame();
 }));
 
 $('#btn-collapse').addEventListener('click', () => { $('#sidebar').classList.add('collapsed'); });
@@ -1705,7 +1706,14 @@ async function loadLogs() {
 }
 
 /* ---------- 其他 ---------- */
-$('#btn-ops-newtab').addEventListener('click', () => window.open('/opsbox/', '_blank'));
+// 运维管理免密：把控制台 token 传给 opsbox 页面，由其 ssoLogin() 换取 ops_token
+function loadOpsFrame() {
+  const f = $('#opsbox-frame');
+  if (f.dataset.token === state.token) return;
+  f.dataset.token = state.token || '';
+  f.src = '/opsbox/?console_token=' + encodeURIComponent(state.token || '');
+}
+$('#btn-ops-newtab').addEventListener('click', () => window.open('/opsbox/?console_token=' + encodeURIComponent(state.token || ''), '_blank'));
 
 async function boot() {
   if (window.innerWidth <= 768) $('#sidebar').classList.add('collapsed');

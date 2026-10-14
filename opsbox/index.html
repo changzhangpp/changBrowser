@@ -291,7 +291,6 @@ async function ssoLogin(){
     if(d && d.data && d.data.token){ token = d.data.token; localStorage.setItem('ops_token', token); }
   }catch(_){}
 }
-if(!token) ssoLogin();
 let cwd = '/workspace';
 let entries = [];
 let sel = new Set();
@@ -756,7 +755,7 @@ $('loginPwd').addEventListener('keydown', e=>{ if(e.key==='Enter') doLogin(); })
 async function doLogin(){
   $('loginErr').textContent = '';
   try{
-    const r = await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r = await fetch(API_BASE + '/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({password:$('loginPwd').value})});
     if(!r.ok){ const e=await r.json().catch(()=>({})); $('loginErr').textContent = e.detail||'登录失败'; return; }
     const d = await r.json();
@@ -769,6 +768,8 @@ async function doLogin(){
 
 /* ---- 启动：探测 token，有效则按 hash 进对应页；401 弹登录 ---- */
 (async function init(){
+  if(!token) await ssoLogin(); // 免密兑换先行：后续请求都带 token，避免 401 抢先弹出登录框
+  if(token) $('loginOverlay').classList.add('hidden');
   const t0 = location.hash === '#files' ? 'files' : 'res';
   switchTab(t0, true);
   if(!token){ showLogin(); return; }

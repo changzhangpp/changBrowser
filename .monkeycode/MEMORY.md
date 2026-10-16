@@ -152,3 +152,12 @@ This file records user instructions, preferences, and teachings for reference in
   - 当前托管终端：webconsole=term_1791990641204_26（限 796MB/0.5 核/256fd），opsbox=term_1791990880756_28；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
   - 登录防爆破：两侧都是 60 秒窗口内错 10 次即锁 60 秒，期间正确密码也返回 429「尝试过于频繁」，排查时先区分 401 与 429
   - 浏览器重启会换掉全部 targetId；窗口刷新配置自 2026-10-13 起按 URL 归档/领养（refresher syncWindows），重启不再丢刷新设置
+
+[Project Knowledge Summary]
+- Date: 2026-10-16
+- Context: 排查「运维管理免密失效 + 密码登不进」，三轮接口验证全过但用户实测仍失败
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - curl 验证后端接口 200 完全无法代表前端路径可用：本次三个真 bug 全在页面 JS（表单 URL 缺 API_BASE 前缀、SSO 异步竞态、初始化时序），最终靠无头浏览器走用户真实路径的 E2E 脚本复现并验证修复（脚本：/tmp/obshots/verify-opsbox-sso.js，可按需重建——console 登录拿 token → 起临时 chrome → CDP 打开 /opsbox/?console_token=xxx → 查 ops_token/登录框/数据行）
+  - 凡是「经代理访问的子应用」类 bug，优先怀疑前端硬编码路径缺前缀；凡是「登录框闪现/不消失」类，优先怀疑异步 token 兑换与 showLogin 的时序竞态
+  - node 手写 CDP 客户端复用 readme-shot-live2.js 的 connectCdp 时，注意握手成功后必须 resolve(api)，漏掉会表现为无限挂起

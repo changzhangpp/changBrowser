@@ -7,20 +7,27 @@
 // 2. 桌面客户端（Local API 50325）不在/连续无响应 → 杀掉残留进程并拉起
 // 3. webconsole（50327）不在 → 拉起
 // 4. opsbox（8002）不在 → 拉起
-// 5. 期望存活实例（keeper-state.json，由控制台 start/stop 维护）死亡 → 调 Local API 重启
+// 5. 期望存活实例（keeper-state.json，由控制台 start/stop 维护）死亡 → 调 Local API 重启，
+//    并按 console-ops.log 里该实例最后已知 URL 自动恢复任务页
 //    - 控制台「停止」/守护规则 stop/删除实例 → 从期望集合移除，keeper 不再拉起
 // 6. 内存守护：实例内存总和逼近系统上限（7G）且存在失控实例（>2.5G）→ 终止并重启该实例，记录日志
+// 7. 系统可用内存（MemAvailable）低于阈值 → 记录挤压告警（气球抽干时进程会无声死亡，留证据链）
 //
 // 与 guard 的关系：guard 做资源超限保护性停止；keeper 只做「死了复活」，两者不冲突。
 
 const { execFile, spawn } = require('child_process');
 const http = require('http');
+const net = require('net');
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 
 const BASE = '/workspace/OpenBrowser/Browserapp';
 const STATE_FILE = '/home/openbrowser/.config/openbrowser/console/keeper-state.json';
 const API_KEY_FILE = '/home/openbrowser/.config/openbrowser/local-api-key.txt';
+const OPS_LOG = '/home/openbrowser/.config/openbrowser/logs/console-ops.log';
+const PROFILES_DIR = '/home/openbrowser/.config/openbrowser/browser-profiles-v2';
+const START_PAGE_HINT = '127.0.0.1:50326';
 const LOOP_SEC = 15;
 const CLIENT_HANG_LIMIT = 3;
 
@@ -88,6 +95,129 @@ function localApi(method, reqPath, body, timeoutMs) {
 
 function readState() {
   try { return JSON.parse(fs.readFileSync(STATE_FILE, 'utf8')); } catch (_) { return {}; }
+}
+
+// ===== 系统可用内存告警（A）=====
+
+const MEM_AVAIL_ALERT_MB = Number(process.env.MEM_AVAIL_ALERT_MB || 300);    // 低于此值记挤压告警
+const MEM_AVAIL_RECOVER_MB = Number(process.env.MEM_AVAIL_RECOVER_MB || 500); // 回升到此值以上记恢复
+const MEM_AVAIL_COOLDOWN_MS = 600000;  // 告警冷却 10 分钟，避免刷屏
+let memAvailAlerting = false;
+let memAvailLastAlert = 0;
+
+function memAvailableAlert() {
+  let availKb = NaN;
+  try {
+    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+) kB/m);
+    if (m) availKb = Number(m[1]);
+  } catch (_) { return; }
+  if (Number.isNaN(availKb)) return;
+  const availMb = Math.round(availKb / 1024);
+  if (availMb < MEM_AVAIL_ALERT_MB) {
+    memAvailAlerting = true;
+    if (Date.now() - memAvailLastAlert >= MEM_AVAIL_COOLDOWN_MS) {
+      memAvailLastAlert = Date.now();
+      log(`内存挤压告警：系统可用内存仅 ${availMb}MB（阈值 ${MEM_AVAIL_ALERT_MB}MB），气球抽干时进程可能无声死亡`);
+    }
+  } else if (memAvailAlerting && availMb >= MEM_AVAIL_RECOVER_MB) {
+    memAvailAlerting = false;
+    log(`内存恢复：系统可用内存回升至 ${availMb}MB`);
+  }
+}
+
+// ===== 复活后按最后已知 URL 恢复任务页（B）=====
+
+// 从 console-ops.log 尾部找该实例最近一条带 url 的事件
+function lastKnownUrl(id) {
+  try {
+    const st = fs.statSync(OPS_LOG);
+    const len = Math.min(st.size, 512 * 1024);
+    const buf = Buffer.alloc(len);
+    const fd = fs.openSync(OPS_LOG, 'r');
+    fs.readSync(fd, buf, 0, len, st.size - len);
+    fs.closeSync(fd);
+    const lines = buf.toString().split('\n').filter(Boolean);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const j = JSON.parse(lines[i]);
+        if (j.profileId === id && typeof j.url === 'string' && /^https?:\/\//.test(j.url) && !j.url.includes(START_PAGE_HINT)) return j.url;
+      } catch (_) { /* 跳过坏行 */ }
+    }
+  } catch (_) { /* 日志不存在 */ }
+  return null;
+}
+
+function httpGetJson(port, reqPath, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port, path: reqPath, timeout: timeoutMs }, (res) => {
+      let b = '';
+      res.on('data', (c) => (b += c));
+      res.on('end', () => { try { resolve(JSON.parse(b)); } catch (e) { reject(e); } });
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('error', reject);
+  });
+}
+
+// 裸 CDP：握手后发 Page.navigate，不等回包（结果由上层 /json/list 复核）
+function cdpNavigate(port, wsPath, url) {
+  return new Promise((resolve) => {
+    const sock = net.connect(port, '127.0.0.1');
+    let buf = Buffer.alloc(0), handshook = false, done = false;
+    const finish = (ok) => { if (!done) { done = true; try { sock.destroy(); } catch (_) {} resolve(ok); } };
+    const key = crypto.randomBytes(16).toString('base64');
+    sock.on('connect', () => {
+      sock.write(`GET ${wsPath} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    sock.on('data', (c) => {
+      buf = Buffer.concat([buf, c]);
+      if (handshook) return;
+      const i = buf.indexOf('\r\n\r\n');
+      if (i < 0) return;
+      if (!buf.slice(0, i).toString().includes('101')) return finish(false);
+      buf = buf.slice(i + 4); handshook = true;
+      const payload = Buffer.from(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
+      const mask = crypto.randomBytes(4);
+      const masked = Buffer.alloc(payload.length);
+      for (let k = 0; k < payload.length; k++) masked[k] = payload[k] ^ mask[k % 4];
+      let header;
+      if (payload.length < 126) header = Buffer.from([0x81, 0x80 | payload.length]);
+      else if (payload.length < 65536) { header = Buffer.alloc(4); header[0] = 0x81; header[1] = 0x80 | 126; header.writeUInt16BE(payload.length, 2); }
+      else { header = Buffer.alloc(10); header[0] = 0x81; header[1] = 0x80 | 127; header.writeBigUInt64BE(BigInt(payload.length), 2); }
+      sock.write(Buffer.concat([header, mask, masked]));
+      setTimeout(() => finish(true), 2500);
+    });
+    sock.on('error', () => finish(false));
+    setTimeout(() => finish(false), 10000);
+  });
+}
+
+// 等浏览器起来（DevToolsActivePort 就绪）→ 把起始页导航到最后已知 URL → /json/list 复核
+async function restoreInstancePage(id, waitedMs = 0) {
+  const url = lastKnownUrl(id);
+  if (!url) { log(`实例 ${id} 无最后已知 URL，跳过页面恢复`); return; }
+  const RETRY_MS = 3000, MAX_WAIT_MS = 45000;
+  if (waitedMs > MAX_WAIT_MS) { log(`实例 ${id} 页面恢复放弃：CDP ${MAX_WAIT_MS / 1000}s 未就绪`); return; }
+  let port = 0;
+  try { port = Number(fs.readFileSync(path.join(PROFILES_DIR, id, 'DevToolsActivePort'), 'utf8').split('\n')[0]); } catch (_) {}
+  let pages = [];
+  if (port) {
+    try { pages = ((await httpGetJson(port, '/json/list')) || []).filter((t) => t.type === 'page'); } catch (_) {}
+  }
+  if (!port || !pages.length) { setTimeout(() => restoreInstancePage(id, waitedMs + RETRY_MS), RETRY_MS); return; }
+  const target = pages.find((t) => (t.url || '').includes(START_PAGE_HINT)) || pages[0];
+  if ((target.url || '') === url) { log(`实例 ${id} 页面已在目标地址`); return; }
+  const wsPath = (target.webSocketDebuggerUrl || '').replace(`ws://127.0.0.1:${port}`, '');
+  const ok = await cdpNavigate(port, wsPath, url);
+  if (!ok) { log(`实例 ${id} 页面恢复失败：CDP 导航未成功`); return; }
+  setTimeout(async () => {
+    try {
+      const t2 = ((await httpGetJson(port, '/json/list')) || []).filter((t) => t.type === 'page');
+      const cur = (t2.find((t) => t.id === target.id) || t2[0] || {}).url || '';
+      if (cur.startsWith(url.split('#')[0])) log(`实例 ${id} 页面恢复确认: ${url.slice(0, 90)}`);
+      else log(`实例 ${id} 页面恢复未确认，当前: ${cur.slice(0, 90)}`);
+    } catch (_) { log(`实例 ${id} 页面恢复复核失败`); }
+  }, 4000);
 }
 
 // ===== 各服务恢复动作 =====
@@ -180,6 +310,7 @@ async function restartInstance(id, reason) {
     } else {
       log(`实例 ${id} 已恢复`);
       cdpFails.delete(id);
+      restoreInstancePage(id).catch(() => {});
     }
   } finally {
     starting.delete(id);
@@ -233,6 +364,7 @@ async function ensureInstances(activeList) {
         startLocks.set(id, Date.now() + 60000);
       } else {
         log(`实例 ${id} 已复活`);
+        restoreInstancePage(id).catch(() => {});
       }
     }).finally(() => starting.delete(id));
   }
@@ -324,11 +456,17 @@ async function loop() {
   }
   try { await ensureConsole(); } catch (e) { log('console err:', e.message); }
   try { await ensureOpsbox(); } catch (e) { log('opsbox err:', e.message); }
+  try { memAvailableAlert(); } catch (e) { log('mem-alert err:', e.message); }
   if (activeList) { try { await ensureInstances(activeList); } catch (e) { log('inst err:', e.message); } }
   try { await memoryGuard(); } catch (e) { log('mem err:', e.message); }
 }
 
-log('keeper 启动，巡检间隔', LOOP_SEC + 's');
-seedState().catch(() => {});
-loop();
-setInterval(loop, LOOP_SEC * 1000);
+if (process.env.KEEPER_RESTORE_ONLY) {
+  // 测试钩子：KEEPER_RESTORE_ONLY=<实例id> 只执行页面恢复然后退出，不进巡检循环
+  restoreInstancePage(String(process.env.KEEPER_RESTORE_ONLY)).then(() => process.exit(0), () => process.exit(1));
+} else {
+  log('keeper 启动，巡检间隔', LOOP_SEC + 's');
+  seedState().catch(() => {});
+  loop();
+  setInterval(loop, LOOP_SEC * 1000);
+}

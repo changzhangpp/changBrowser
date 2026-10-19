@@ -88,11 +88,13 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;bac
 /* 弹窗 */
 .overlay{position:fixed;inset:0;background:rgba(4,8,18,.72);z-index:50;display:flex;align-items:center;justify-content:center;padding:16px}
 .overlay.hidden{display:none}
-.dialog{background:var(--bg2);border:1px solid var(--line);border-radius:16px;padding:22px;width:min(460px,94vw);max-height:88vh;overflow-y:auto}
+.dialog{background:var(--bg2);border:1px solid var(--line);border-radius:16px;padding:14px 16px;width:min(520px,94vw);max-height:88vh;overflow-y:auto}
 .dialog h3{margin-bottom:4px}
-.dialog .muted{color:var(--muted);font-size:12px;margin-bottom:10px}
+.dialog .muted{color:var(--muted);font-size:12px;margin-bottom:6px}
+.dialog label{margin:5px 0 3px}
+.dialog input,.dialog select{min-height:34px;padding:6px 10px}
 .dialog .row2{display:grid;grid-template-columns:1fr 1fr;gap:0 14px}
-.dialog .btns{display:flex;gap:10px;margin-top:18px}
+.dialog .btns{display:flex;gap:8px;margin-top:10px}
 .dialog .btns button{flex:1}
 .toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--line);padding:9px 18px;border-radius:12px;z-index:99;max-width:90vw;display:none}
 .toast.show{display:block}
@@ -327,12 +329,10 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;bac
     <input id="d-remark">
     <div id="d-extra"></div>
     <div class="btns" id="dlg-btns">
-      <button class="ghost" id="dlg-cancel">取消</button>
-      <button class="primary" id="dlg-save">保存</button>
-    </div>
-    <div class="btns" id="dlg-btns2" style="margin-top:10px">
       <button id="d-refresh-cfg">定时刷新</button>
       <button class="danger" id="d-delete">删除实例</button>
+      <button class="ghost" id="dlg-cancel">取消</button>
+      <button class="primary" id="dlg-save">保存</button>
     </div>
   </div>
 </div>
@@ -656,7 +656,17 @@ async function openSettings(id) {
 }
 
 $('#dlg-cancel').addEventListener('click', () => $('#dlg-mask').classList.add('hidden'));
-$('#dlg-mask').addEventListener('click', (e) => { if (e.target === $('#dlg-mask')) $('#dlg-mask').classList.add('hidden'); });
+$('#dlg-mask').addEventListener('click', (e) => {
+  if (e.target !== $('#dlg-mask')) return;
+  // 内容超高的弹窗：底部字段可能被裁剪，误点遮罩不该直接丢弃整个表单
+  const dlg = document.querySelector('#dlg-mask .dialog');
+  if (dlg && dlg.scrollHeight > dlg.clientHeight + 4) return;
+  $('#dlg-mask').classList.add('hidden');
+});
+// 聚焦即滚入视野：矮屏幕上底部字段不再"点不到"
+$('#dlg-mask').addEventListener('focusin', (e) => {
+  if (e.target && e.target.scrollIntoView) e.target.scrollIntoView({ block: 'nearest' });
+});
 
 $('#dlg-save').addEventListener('click', async () => {
   const id = $('#dlg-save').dataset.id;

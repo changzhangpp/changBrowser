@@ -237,6 +237,12 @@ class ConsoleServer {
 
     if (pathname === '/opsbox/sso-token') return this.handleOpsboxSso(req, res);
     if (pathname.startsWith('/opsbox/')) {
+      // 整体应用入口校验一次：控制台登录后 Cookie 全程生效，运维管理内部不再逐请求验证 token
+      const q = new URLSearchParams(url.search);
+      const queryToken = q.get('console_token') || '';
+      if (!this.authOk(req) && !verifyToken(this.secretBuf, queryToken)) {
+        return sendJson(res, 401, { code: 401, msg: 'unauthorized' });
+      }
       req.url = pathname.slice('/opsbox'.length) + url.search || '/';
       return proxyOpsbox(req, res);
     }

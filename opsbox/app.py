@@ -127,16 +127,8 @@ def _make_token() -> str:
     return f"{exp}.{sig}"
 
 
-def _auth(request: Request):
-    token = request.headers.get("x-auth-token") or request.query_params.get("token")
-    if not token or "." not in token:
-        raise HTTPException(401, "未登录")
-    exp, sig = token.split(".", 1)
-    if not exp.isdigit() or int(exp) < time.time():
-        raise HTTPException(401, "登录已过期")
-    good = hmac.new(SECRET, exp.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, good):
-        raise HTTPException(401, "凭证无效")
+# 鉴权策略（2026-10-19）：去掉逐请求 token 校验，改由控制台入口统一校验一次。
+# opsbox 仅绑定 127.0.0.1，外网流量只能经 webconsole /opsbox/* 代理进入，代理处已做登录校验。
 
 
 _failures: list = []
@@ -183,7 +175,6 @@ def _fail(msg: str):
 
 @app.get("/api/list")
 async def api_list(request: Request, path: str = "/"):
-    _auth(request)
     p = _abs(path)
     _check_exists(p)
     if not os.path.isdir(p):
@@ -214,7 +205,6 @@ async def api_list(request: Request, path: str = "/"):
 
 @app.get("/api/read")
 async def api_read(request: Request, path: str):
-    _auth(request)
     p = _abs(path)
     _check_exists(p)
     if os.path.isdir(p):
@@ -238,7 +228,6 @@ async def api_read(request: Request, path: str):
 
 @app.post("/api/save")
 async def api_save(request: Request, body: SaveBody):
-    _auth(request)
     p = _abs(body.path)
     _check_exists(os.path.dirname(p))
     if body.encoding not in ("utf-8", "gbk", "latin-1"):
@@ -254,7 +243,6 @@ async def api_save(request: Request, body: SaveBody):
 
 @app.post("/api/mkdir")
 async def api_mkdir(request: Request, body: PathBody):
-    _auth(request)
     p = _abs(body.path)
     if os.path.exists(p):
         _fail("已存在")
@@ -264,7 +252,6 @@ async def api_mkdir(request: Request, body: PathBody):
 
 @app.post("/api/touch")
 async def api_touch(request: Request, body: PathBody):
-    _auth(request)
     p = _abs(body.path)
     if os.path.exists(p):
         _fail("已存在")
@@ -274,7 +261,6 @@ async def api_touch(request: Request, body: PathBody):
 
 @app.post("/api/delete")
 async def api_delete(request: Request, body: DeleteBody):
-    _auth(request)
     if not body.paths:
         _fail("未选择")
     done, errors = [], []
@@ -296,7 +282,6 @@ async def api_delete(request: Request, body: DeleteBody):
 
 @app.post("/api/rename")
 async def api_rename(request: Request, body: RenameBody):
-    _auth(request)
     p = _abs(body.path)
     _check_exists(p)
     new_name = body.new_name.strip()
@@ -322,7 +307,6 @@ def _unique_dest(dest_dir: str, name: str) -> str:
 
 @app.post("/api/copy")
 async def api_copy(request: Request, body: TransferBody):
-    _auth(request)
     dest = _abs(body.dest)
     if not os.path.isdir(dest):
         _fail(f"目标目录不存在: {dest}")
@@ -347,7 +331,6 @@ async def api_copy(request: Request, body: TransferBody):
 
 @app.post("/api/move")
 async def api_move(request: Request, body: TransferBody):
-    _auth(request)
     dest = _abs(body.dest)
     if not os.path.isdir(dest):
         _fail(f"目标目录不存在: {dest}")
@@ -369,7 +352,6 @@ async def api_move(request: Request, body: TransferBody):
 
 @app.post("/api/upload")
 async def api_upload(request: Request, dest: str = Form(...), file: UploadFile = File(...)):
-    _auth(request)
     d = _abs(dest)
     if not os.path.isdir(d):
         _fail(f"目标目录不存在: {d}")
@@ -384,7 +366,6 @@ async def api_upload(request: Request, dest: str = Form(...), file: UploadFile =
 
 @app.get("/api/download")
 async def api_download(request: Request, path: str, background: BackgroundTasks):
-    _auth(request)
     p = _abs(path)
     _check_exists(p)
     if os.path.isfile(p):
@@ -403,7 +384,6 @@ async def api_download(request: Request, path: str, background: BackgroundTasks)
 
 @app.get("/api/preview")
 async def api_preview(request: Request, path: str):
-    _auth(request)
     p = _abs(path)
     _check_exists(p)
     mime, _ = mimetypes.guess_type(p)
@@ -417,7 +397,6 @@ ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".ta
 
 @app.post("/api/unarchive")
 async def api_unarchive(request: Request, body: UnarchiveBody):
-    _auth(request)
     p = _abs(body.path)
     _check_exists(p)
     lower = p.lower()
@@ -453,7 +432,6 @@ SKIP_DIRS = {"/proc", "/sys", "/dev", "/run"}
 
 @app.post("/api/search")
 async def api_search(request: Request, body: SearchBody):
-    _auth(request)
     root = _abs(body.dir)
     _check_exists(root)
     q = body.q.strip().lower()
@@ -629,7 +607,6 @@ def _cpu_model():
 
 @app.get("/api/stats")
 async def stats(request: Request):
-    _auth(request)
     with hist_lock:
         snap = list(hist)
     cur = snap[-1] if snap else None
@@ -770,7 +747,6 @@ class KillBody(BaseModel):
 
 @app.post("/api/proc/kill")
 async def api_proc_kill(request: Request, body: KillBody):
-    _auth(request)
     pid = body.pid
     if pid in (1, os.getpid(), os.getppid()):
         raise HTTPException(400, "拒绝结束该进程")
@@ -791,7 +767,6 @@ async def api_proc_kill(request: Request, body: KillBody):
 @app.post("/api/mem/cleanup")
 async def api_mem_cleanup(request: Request):
     """内存清理：sync + 释放页缓存/目录项/inode 缓存（需要 root 运行）"""
-    _auth(request)
     before = psutil.virtual_memory().available
     os.sync()
     try:

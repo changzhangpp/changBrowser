@@ -283,7 +283,8 @@ async function ensureOpsbox() {
   const pids = await pgrep('uvicorn app:app');
   if (pids.length) { await killPids(pids); }
   log('opsbox 不在 → 拉起');
-  const child = spawn('python3', ['-m', 'uvicorn', 'app:app', '--host', '0.0.0.0', '--port', '8002'], {
+  // 只绑回环：外部流量必须经 webconsole /opsbox/* 代理（入口统一校验一次）
+  const child = spawn('python3', ['-m', 'uvicorn', 'app:app', '--host', '127.0.0.1', '--port', '8002'], {
     cwd: '/workspace/OpenBrowser/opsbox', detached: true, stdio: 'ignore',
   });
   child.unref();

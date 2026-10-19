@@ -149,7 +149,8 @@ This file records user instructions, preferences, and teachings for reference in
   - opsbox 启动必须 cd 到 opsbox 目录（uvicorn 按 cwd 找 app.py）；口令解析顺序为 OPS_PASSWORD 等环境变量 → console-password.txt（含 /home/openbrowser 硬编码候选）→ change-me；.secret 用于 ops_token 签发，删除即全体 token 失效
   - 两服务的口令都是启动时读一次并缓存，改 console-password.txt 后必须重启两个服务才生效
   - 服务间认证头不同：控制台 `x-console-token`（或 console_token cookie），opsbox `x-auth-token`；运维管理免密链路 = 控制台把 console_token 通过 `/opsbox/?console_token=` 传给 opsbox 页面，由其 ssoLogin() 调 `/opsbox/sso-token` 换 ops_token（30 天）
-  - 当前托管终端：webconsole=term_1791990641204_26（限 796MB/0.5 核/256fd），opsbox=term_1791990880756_28，keeper=term_1792396238600_30；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
+  - 鉴权架构（2026-10-19 起）：opsbox 后端已删除逐请求 token 校验（原 17 个端点的 _auth 全移除），改为入口统一校验一次——webconsole 对 `/opsbox/*` 代理整体做 authOk（console_token Cookie / 头 / URL query 均可），控制台登录一次后全程畅通；opsbox 改绑 127.0.0.1（start.sh 与 keeper.js ensureOpsbox 双处），外部只能走控制台代理这条受保护通道；opsbox 页内 401 只 toast 提示，不再弹密码框
+  - 当前托管终端：webconsole=term_1792414818977_34（限 796MB/0.5 核/256fd），keeper=term_1792414794612_32，opsbox 由 keeper 自动拉起（不再单独占终端）；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
   - 登录防爆破：两侧都是 60 秒窗口内错 10 次即锁 60 秒，期间正确密码也返回 429「尝试过于频繁」，排查时先区分 401 与 429
   - 浏览器重启会换掉全部 targetId；窗口刷新配置自 2026-10-13 起按 URL 归档/领养（refresher syncWindows），重启不再丢刷新设置
 

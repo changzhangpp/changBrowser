@@ -173,3 +173,13 @@ This file records user instructions, preferences, and teachings for reference in
   - memoryGuard 触发条件是「实例 RSS 总和 >7G 且单实例 >2.5G 连续确认」，总量超限无单点失控只告警不杀，启动它对低内存环境安全
   - keeper 复活实例只恢复浏览器和起始页，任务页需按最后已知 URL（console-ops.log 里该实例最近一条事件的 url 字段）手动 Page.navigate 恢复【2026-10-19 起已自动化：keeper 复活后自动按最后已知 URL 导航并复核；KEEPER_RESTORE_ONLY=<实例id> 环境变量可单独测试页面恢复链路】
   - keeper 每轮巡检读 MemAvailable：低于 300MB 记挤压告警（10 分钟冷却），回升过 500MB 记恢复；阈值可用 MEM_AVAIL_ALERT_MB / MEM_AVAIL_RECOVER_MB 环境变量覆盖
+
+[Project Knowledge Summary]
+- Date: 2026-10-19
+- Context: 实例名称被清空成 1-5、实例反复静默死亡后页面恢复错误的排查与加固
+- Category: Troubleshooting & Debugging / Operations & Deployment
+- Instructions:
+  - 实例原始名的兜底来源是引擎存储 openbrowser-engine.json 的 title 字段（name 被重置时 title 常保留旧名）；改名走 Local API /api/v2/browser-profile/update（profile_id+name），不要手改存储文件
+  - keeper 页面恢复的权威数据源 = refresh-config.json 里用户配置的窗口 URL（console-ops.log 的 URL 时好时坏，只作兜底）；恢复只发生在复活时，活着的实例停错页面不会被自动纠偏，需 KEEPER_RESTORE_ONLY=<id> 单独纠
+  - 实例静默死亡的重复诱因是宿主机内存气球抽干（当日 14:36/14:57/15:16 三次告警，最低 158MB），与代码无关；keeper 每 15s 巡检复活，但 Local API 偶发 internal error 会让恢复拖到下一轮
+  - keeper spawnUser 已把实例进程写入 /sys/fs/cgroup/ob_instances 独立 cgroup，后台终端重启不再连坐实例；引擎存储在实例重启时会整文件落盘，用户在界面上的手动改名以最后一次落盘为准

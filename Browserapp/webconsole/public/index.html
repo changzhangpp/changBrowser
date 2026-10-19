@@ -115,7 +115,7 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;bac
 .kbbar{position:absolute;left:0;right:0;bottom:0;display:flex;gap:6px;align-items:center;padding:6px 8px;background:rgba(12,19,38,.92);border-top:1px solid var(--line);z-index:6}
 .kbbar input{flex:1;min-height:34px}
 .kbbar button{min-height:32px;padding:4px 12px;font-size:12.5px}
-@media (min-width:769px){ #kb-bar{display:none!important} }
+#v-kbtoggle.on{color:#7fd18a;border-color:#7fd18a55}
 #v-frame{touch-action:none}
 /* CSS 横屏兜底（orientation.lock 不可用时） */
 .viewer.rot{position:absolute;top:0;left:0;width:100vh;height:100vw;transform:rotate(90deg) translateY(-100%);transform-origin:top left;z-index:40;background:#05080f}
@@ -231,26 +231,27 @@ main{flex:1;display:flex;flex-direction:column;min-width:0;position:relative;bac
             <option value="62" selected>标清</option>
             <option value="80">高清</option>
           </select>
-           <select id="v-refresh" title="当前窗口自动刷新">
-             <option value="inherit">刷新:跟随实例</option>
-             <option value="0">刷新:关</option>
-            <option value="5">5秒</option>
-            <option value="15">15秒</option>
-            <option value="30">30秒</option>
-            <option value="60">1分钟</option>
-            <option value="120">2分钟</option>
-            <option value="300">5分钟</option>
-            <option value="600">10分钟</option>
-            <option value="1800">30分钟</option>
-             <option value="custom">自定义…</option>
-           </select>
-           <span id="v-refresh-countdown" class="refresh-countdown">未设置</span>
+            <select id="v-refresh" title="当前窗口自动刷新">
+              <option value="inherit">刷新:跟随实例</option>
+              <option value="0">刷新:关</option>
+             <option value="5">5秒</option>
+             <option value="15">15秒</option>
+             <option value="30">30秒</option>
+             <option value="60">1分钟</option>
+             <option value="120">2分钟</option>
+             <option value="300">5分钟</option>
+             <option value="600">10分钟</option>
+             <option value="1800">30分钟</option>
+              <option value="custom">自定义…</option>
+            </select>
+            <span id="v-refresh-countdown" class="refresh-countdown">未设置</span>
+           <button id="v-kbtoggle" class="on" title="显示/隐藏文字输入条（支持输入法）">文字输入</button>
         </div>
         <div class="viewport" id="vport">
           <div class="hint" id="v-hint">点击左侧实例卡片「打开」进行操作 · [+] 新开窗口 · 点击标签切换窗口</div>
           <div class="state-badge hidden" id="v-state"></div>
           <div class="kbbar" id="kb-bar">
-            <input id="kb-input" placeholder="点此输入，文字自动发到页面" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+            <input id="kb-input" placeholder="点此输入（支持中文输入法），文字直达页面焦点处 · 回车=确认" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
           </div>
         </div>
       </div>
@@ -1542,7 +1543,39 @@ $('#v-zout').addEventListener('click', () => zoomBy(1 / 1.3));
 
 $('#v-go').addEventListener('click', navigateUrl);
 
+/* 文字输入条：本地输入法组合 → 提交文本经 Input.insertText 直达页面焦点处。
+   关键：组合期间（compositionstart..end）不转发、不清空输入框，
+   否则拼音过程会被拆成散字母发到远端，输入法也被打断 */
+let kbComposing = false;
+let kbBarHidden = false;
+try { kbBarHidden = localStorage.getItem('kbbar_hidden') === '1'; } catch (_) {}
+
+function applyKbBar() {
+  const bar = $('#kb-bar'), btn = $('#v-kbtoggle');
+  if (!bar) return;
+  bar.classList.toggle('hidden', kbBarHidden);
+  if (btn) btn.classList.toggle('on', !kbBarHidden);
+}
+
+$('#v-kbtoggle').addEventListener('click', () => {
+  kbBarHidden = !kbBarHidden;
+  try { localStorage.setItem('kbbar_hidden', kbBarHidden ? '1' : '0'); } catch (_) {}
+  applyKbBar();
+});
+
+$('#kb-input').addEventListener('compositionstart', () => { kbComposing = true; });
+
+$('#kb-input').addEventListener('compositionend', async (e) => {
+  kbComposing = false;
+  if (e.data) {
+    try { await cdpSend('Input.insertText', { text: e.data }); } catch (_) {}
+  }
+  e.target.value = '';
+  e.target.focus();
+});
+
 $('#kb-input').addEventListener('input', (e) => {
+  if (kbComposing) return; // 组合中的 insertCompositionText 不转发
   if (e.inputType === 'insertText' && e.data) {
     cdpSend('Input.insertText', { text: e.data }).catch(() => {});
   }
@@ -1550,6 +1583,7 @@ $('#kb-input').addEventListener('input', (e) => {
 });
 
 $('#kb-input').addEventListener('keydown', async (e) => {
+  if (kbComposing || e.isComposing || e.keyCode === 229) return; // 输入法候选确认键留给本地 IME
   if (e.key === 'Enter') {
     e.preventDefault();
     const base = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 };
@@ -1567,6 +1601,8 @@ $('#kb-input').addEventListener('keydown', async (e) => {
     } catch (_) {}
   }
 });
+
+applyKbBar();
 
 $('#v-fs').addEventListener('click', () => {
   if (document.fullscreenElement) { document.exitFullscreen().catch(() => {}); return; }

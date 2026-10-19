@@ -38,6 +38,47 @@ function ensureInstanceCgroup() {
 function cgroupAdopt(pid) {
   try { fs.appendFileSync(path.join(INSTANCE_CGROUP, 'cgroup.procs'), pid + '\n'); } catch (_) { /* 进程可能已退出 */ }
 }
+
+// ===== 实例名字自愈 =====
+// 引擎重启会用内存旧名覆盖存储，把用户改的名字打回数字。这里持续备份非数字名字，
+// 一旦发现 name 被重置成 数字/环境N/空，立即用备份名改回。
+const NAMES_BACKUP = '/home/openbrowser/.config/openbrowser/console/names-backup.json';
+
+function isLostName(name) {
+  const n = String(name || '').trim();
+  return !n || /^\d+$/.test(n) || /^环境\s*\d+$/.test(n);
+}
+
+async function reconcileNames() {
+  try {
+    const r = await localApi('GET', '/api/v2/browser-profile/list', null, 10000);
+    const list = (r && r.code === 0 && r.data && Array.isArray(r.data.list)) ? r.data.list : [];
+    if (!list.length) return;
+    let backup = {};
+    try { backup = JSON.parse(fs.readFileSync(NAMES_BACKUP, 'utf8')); } catch (_) {}
+    let changed = false;
+    for (const p of list) {
+      const id = p.profile_id || p.user_id || p.id;
+      if (!id) continue;
+      const name = String(p.name || '');
+      if (isLostName(name)) {
+        const good = backup[id];
+        if (good && good !== name) {
+          const u = await localApi('POST', '/api/v2/browser-profile/update', { profile_id: id, name: good }, 10000);
+          if (u && u.code === 0) log(`实例「${id}」名字被引擎重置 → 已自动恢复为「${good}」`);
+        }
+      } else if (backup[id] !== name) {
+        backup[id] = name;
+        changed = true;
+      }
+    }
+    try {
+      fs.mkdirSync(path.dirname(NAMES_BACKUP), { recursive: true });
+      fs.writeFileSync(NAMES_BACKUP, JSON.stringify(backup, null, 2));
+      if (changed) log('实例名字备份已更新:', JSON.stringify(backup));
+    } catch (_) {}
+  } catch (_) { /* local api 暂不可达，下轮再试 */ }
+}
 const PROFILES_DIR = '/home/openbrowser/.config/openbrowser/browser-profiles-v2';
 const START_PAGE_HINT = '127.0.0.1:50326';
 const LOOP_SEC = 15;
@@ -478,6 +519,7 @@ async function loop() {
   }
   try { await ensureConsole(); } catch (e) { log('console err:', e.message); }
   try { await ensureOpsbox(); } catch (e) { log('opsbox err:', e.message); }
+  try { await reconcileNames(); } catch (e) { log('names err:', e.message); }
   try { memAvailableAlert(); } catch (e) { log('mem-alert err:', e.message); }
   if (activeList) { try { await ensureInstances(activeList); } catch (e) { log('inst err:', e.message); } }
   try { await memoryGuard(); } catch (e) { log('mem err:', e.message); }

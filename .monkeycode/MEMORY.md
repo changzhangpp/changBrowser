@@ -149,7 +149,7 @@ This file records user instructions, preferences, and teachings for reference in
   - opsbox 启动必须 cd 到 opsbox 目录（uvicorn 按 cwd 找 app.py）；口令解析顺序为 OPS_PASSWORD 等环境变量 → console-password.txt（含 /home/openbrowser 硬编码候选）→ change-me；.secret 用于 ops_token 签发，删除即全体 token 失效
   - 两服务的口令都是启动时读一次并缓存，改 console-password.txt 后必须重启两个服务才生效
   - 服务间认证头不同：控制台 `x-console-token`（或 console_token cookie），opsbox `x-auth-token`；运维管理免密链路 = 控制台把 console_token 通过 `/opsbox/?console_token=` 传给 opsbox 页面，由其 ssoLogin() 调 `/opsbox/sso-token` 换 ops_token（30 天）
-  - 当前托管终端：webconsole=term_1791990641204_26（限 796MB/0.5 核/256fd），opsbox=term_1791990880756_28；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
+  - 当前托管终端：webconsole=term_1791990641204_26（限 796MB/0.5 核/256fd），opsbox=term_1791990880756_28，keeper=term_1792390251183_29；Xvfb=term_1791106260036_3、桌面客户端=term_1791107120012_6 不许动
   - 登录防爆破：两侧都是 60 秒窗口内错 10 次即锁 60 秒，期间正确密码也返回 429「尝试过于频繁」，排查时先区分 401 与 429
   - 浏览器重启会换掉全部 targetId；窗口刷新配置自 2026-10-13 起按 URL 归档/领养（refresher syncWindows），重启不再丢刷新设置
 
@@ -161,3 +161,13 @@ This file records user instructions, preferences, and teachings for reference in
   - curl 验证后端接口 200 完全无法代表前端路径可用：本次三个真 bug 全在页面 JS（表单 URL 缺 API_BASE 前缀、SSO 异步竞态、初始化时序），最终靠无头浏览器走用户真实路径的 E2E 脚本复现并验证修复（脚本：/tmp/obshots/verify-opsbox-sso.js，可按需重建——console 登录拿 token → 起临时 chrome → CDP 打开 /opsbox/?console_token=xxx → 查 ops_token/登录框/数据行）
   - 凡是「经代理访问的子应用」类 bug，优先怀疑前端硬编码路径缺前缀；凡是「登录框闪现/不消失」类，优先怀疑异步 token 兑换与 showLogin 的时序竞态
   - node 手写 CDP 客户端复用 readme-shot-live2.js 的 connectCdp 时，注意握手成功后必须 resolve(api)，漏掉会表现为无限挂起
+
+[Project Knowledge Summary]
+- Date: 2026-10-19
+- Context: 排查实例1（env-001）10-15 无声终止事件
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - 静默死亡排查链：console-ops.log（控制台动作）→ dmesg（内核 OOM/balloon Out of puff）→ Crashpad 转储 → guard events API → keeper-state.json；四者全空白 + profile 目录 mtime 停在死亡时刻（Local State/Default）即可定死亡窗口，结论只能写「内存压力下的异常退出」，无法定位具体信号
+  - keeper.js 是独立守护进程（15s 巡检：Xvfb/桌面客户端/webconsole/opsbox 端口探活 + 期望实例复活 + memoryGuard），代码里没有任何自启动接线，必须手动常驻；它不在跑 = 实例死了没人拉
+  - memoryGuard 触发条件是「实例 RSS 总和 >7G 且单实例 >2.5G 连续确认」，总量超限无单点失控只告警不杀，启动它对低内存环境安全
+  - keeper 复活实例只恢复浏览器和起始页，任务页需按最后已知 URL（console-ops.log 里该实例最近一条事件的 url 字段）手动 Page.navigate 恢复

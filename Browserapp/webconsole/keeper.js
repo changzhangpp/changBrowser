@@ -26,6 +26,18 @@ const BASE = '/workspace/OpenBrowser/Browserapp';
 const STATE_FILE = '/home/openbrowser/.config/openbrowser/console/keeper-state.json';
 const API_KEY_FILE = '/home/openbrowser/.config/openbrowser/local-api-key.txt';
 const OPS_LOG = '/home/openbrowser/.config/openbrowser/logs/console-ops.log';
+const REFRESH_CONFIG = '/home/openbrowser/.config/openbrowser/console/refresh-config.json';
+// 实例专用 cgroup：脱离任何后台终端的 cgroup，终端/keeper 重启不再连坐杀死实例
+const INSTANCE_CGROUP = '/sys/fs/cgroup/ob_instances';
+
+function ensureInstanceCgroup() {
+  try { fs.mkdirSync(INSTANCE_CGROUP, { recursive: true }); return true; }
+  catch (e) { log('实例 cgroup 创建失败(进程将随终端存亡):', e.message); return false; }
+}
+
+function cgroupAdopt(pid) {
+  try { fs.appendFileSync(path.join(INSTANCE_CGROUP, 'cgroup.procs'), pid + '\n'); } catch (_) { /* 进程可能已退出 */ }
+}
 const PROFILES_DIR = '/home/openbrowser/.config/openbrowser/browser-profiles-v2';
 const START_PAGE_HINT = '127.0.0.1:50326';
 const LOOP_SEC = 15;
@@ -58,6 +70,7 @@ function spawnUser(cmd, args, cwd) {
     cmd, ...args,
   ], { cwd, detached: true, stdio: 'ignore' });
   child.unref();
+  cgroupAdopt(child.pid);
   log('spawned(uid1000):', cmd, args.join(' '), '@', cwd);
 }
 
@@ -129,6 +142,14 @@ function memAvailableAlert() {
 
 // 从 console-ops.log 尾部找该实例最近一条带 url 的事件
 function lastKnownUrl(id) {
+  // 首选：刷新配置里用户设定的窗口 URL（实例设置的权威来源，跨重启稳定）
+  try {
+    const cfg = JSON.parse(fs.readFileSync(REFRESH_CONFIG, 'utf8'));
+    const entry = cfg[id];
+    const wins = entry && entry.windows ? Object.values(entry.windows) : [];
+    const hit = wins.find((w) => w && w.enabled !== false && /^https?:\/\//.test(w.url || ''));
+    if (hit) return hit.url;
+  } catch (_) { /* 配置缺失则走日志兜底 */ }
   try {
     const st = fs.statSync(OPS_LOG);
     const len = Math.min(st.size, 512 * 1024);
@@ -467,6 +488,7 @@ if (process.env.KEEPER_RESTORE_ONLY) {
   restoreInstancePage(String(process.env.KEEPER_RESTORE_ONLY)).then(() => process.exit(0), () => process.exit(1));
 } else {
   log('keeper 启动，巡检间隔', LOOP_SEC + 's');
+  ensureInstanceCgroup();
   seedState().catch(() => {});
   loop();
   setInterval(loop, LOOP_SEC * 1000);

@@ -15,7 +15,7 @@
 //
 // 与 guard 的关系：guard 做资源超限保护性停止；keeper 只做「死了复活」，两者不冲突。
 
-const { execFile, spawn } = require('child_process');
+const { execFile, spawn, execSync } = require('child_process');
 const http = require('http');
 const net = require('net');
 const crypto = require('crypto');
@@ -37,6 +37,29 @@ function ensureInstanceCgroup() {
 
 function cgroupAdopt(pid) {
   try { fs.appendFileSync(path.join(INSTANCE_CGROUP, 'cgroup.procs'), pid + '\n'); } catch (_) { /* 进程可能已退出 */ }
+}
+
+// ===== Swap 守护 =====
+// 宿主机气球抽干可用内存时，内核有 Swap 可换出冷页而不是 OOM 杀实例（治本层）。
+const SWAP_FILE = '/swapfile';
+
+function ensureSwap() {
+  try {
+    const active = execSync('swapon --show --noheadings 2>/dev/null', { encoding: 'utf8' }).trim();
+    if (active) return;
+    if (!fs.existsSync(SWAP_FILE)) {
+      try {
+        execSync(`fallocate -l 4G ${SWAP_FILE}`, { stdio: 'ignore' });
+      } catch (_) {
+        execSync(`dd if=/dev/zero of=${SWAP_FILE} bs=1M count=4096 status=none`, { stdio: 'ignore' });
+      }
+      execSync(`chmod 600 ${SWAP_FILE} && mkswap ${SWAP_FILE}`, { stdio: 'ignore' });
+    }
+    execSync(`swapon ${SWAP_FILE}`, { stdio: 'ignore' });
+    log('swap 已启用:', SWAP_FILE, '(4G)');
+  } catch (e) {
+    log('swap 启用失败(不影响其他守护):', e.message);
+  }
 }
 
 // ===== 实例名字自愈 =====
@@ -531,6 +554,7 @@ if (process.env.KEEPER_RESTORE_ONLY) {
 } else {
   log('keeper 启动，巡检间隔', LOOP_SEC + 's');
   ensureInstanceCgroup();
+  ensureSwap();
   seedState().catch(() => {});
   loop();
   setInterval(loop, LOOP_SEC * 1000);

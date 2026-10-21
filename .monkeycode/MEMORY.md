@@ -183,3 +183,13 @@ This file records user instructions, preferences, and teachings for reference in
   - keeper 页面恢复的权威数据源 = refresh-config.json 里用户配置的窗口 URL（console-ops.log 的 URL 时好时坏，只作兜底）；恢复只发生在复活时，活着的实例停错页面不会被自动纠偏，需 KEEPER_RESTORE_ONLY=<id> 单独纠
   - 实例静默死亡的重复诱因是宿主机内存气球抽干（当日 14:36/14:57/15:16 三次告警，最低 158MB），与代码无关；keeper 每 15s 巡检复活，但 Local API 偶发 internal error 会让恢复拖到下一轮
   - keeper spawnUser 已把实例进程写入 /sys/fs/cgroup/ob_instances 独立 cgroup，后台终端重启不再连坐实例；引擎存储在实例重启时会整文件落盘，用户在界面上的手动改名以最后一次落盘为准
+
+[Project Knowledge Summary]
+- Date: 2026-10-20
+- Context: 排查「实例被强制终止、页面回退、恢复不正确」时补齐取证日志
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - 定位页面级异常先看 `~/.config/openbrowser/logs/tab-events.log`：记录标签页 created/gone/url-changed/crash，每行附带当时 availMb、swapUsedMb、PSI some/full
+  - 内存时序看 `~/.config/openbrowser/logs/memory-samples.log`：keeper 每 15s 一行 JSON（可用内存、swap、PSI、各实例 RSS），gapSec > 60 说明巡检被挂起
+  - 进程卡死取证看 `freeze-forensics.log`（进程 D 状态与 wchan），页面操作看 `console-ops.log`，三者按 ts 对齐即可还原时间线
+  - 已修 `instanceMemoryMap` 的实例 id 解析：Chrome 重写 cmdline 为空格分隔，旧正则会把参数并进实例 id，导致内存守护拿到非法 id

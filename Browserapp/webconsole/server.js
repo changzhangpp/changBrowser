@@ -182,6 +182,8 @@ class ConsoleServer {
     this.castPool = new Map();
     this.hangFails = new Map(); // profileId/targetId -> consecutive probe failures
     this.hangProbeTimeoutMs = 4000;
+    this.tabSnapshot = new Map(); // profileId -> { targetId: { url, title } }，用于页面事件取证
+    this.tabCrashSeen = new Map(); // profileId/targetId -> 已记录的崩溃 URL，避免重复刷日志
     this.refresher = new Refresher({
       localApiBase: this.config.localApiBase,
       apiKey: this.apiKey,
@@ -633,6 +635,101 @@ class ConsoleServer {
     } catch (_) { /* ignore */ }
   }
 
+  // ---- 页面级事件取证（只记录，不改变任何页面行为）----
+  // 目标：把「页面被强制终止、回退、恢复不正确」还原成时间线。
+  // 记录标签页的出现/消失/URL 变化/崩溃页，并附当时的内存快照（可用内存、swap、PSI）。
+
+  appendRotating(name, line, maxBytes = 4 * 1024 * 1024) {
+    try {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+      const file = path.join(LOG_DIR, name);
+      try {
+        if (fs.statSync(file).size > maxBytes) fs.renameSync(file, `${file}.1`);
+      } catch (_) { /* 文件尚不存在 */ }
+      fs.appendFileSync(file, line + '\n');
+    } catch (_) { /* ignore */ }
+  }
+
+  memorySnapshot() {
+    const snap = {};
+    try {
+      const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+      const pick = (key) => {
+        const m = mi.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'));
+        return m ? Math.round(Number(m[1]) / 1024) : null;
+      };
+      snap.availMb = pick('MemAvailable');
+      snap.freeMb = pick('MemFree');
+      snap.cachedMb = pick('Cached');
+      snap.swapUsedMb = pick('SwapTotal') === null ? null : pick('SwapTotal') - pick('SwapFree');
+      snap.swapFreeMb = pick('SwapFree');
+      snap.swapCachedMb = pick('SwapCached');
+    } catch (_) { /* ignore */ }
+    try {
+      const psi = fs.readFileSync('/proc/pressure/memory', 'utf8');
+      const some = psi.match(/some avg10=([\d.]+) avg60=([\d.]+)/);
+      const full = psi.match(/full avg10=([\d.]+) avg60=([\d.]+)/);
+      if (some) { snap.psiSome10 = Number(some[1]); snap.psiSome60 = Number(some[2]); }
+      if (full) { snap.psiFull10 = Number(full[1]); snap.psiFull60 = Number(full[2]); }
+    } catch (_) { /* 内核未开启 PSI */ }
+    return snap;
+  }
+
+  isCrashTab(t) {
+    const url = String(t.url || '');
+    const title = String(t.title || '');
+    return url.startsWith('chrome-error://')
+      || /^(aw, snap|page crashed|crash)/i.test(title)
+      || /已崩溃|页面已停止|崩溃了/.test(title);
+  }
+
+  snapshotTabs(profileId, pages) {
+    const prev = this.tabSnapshot.get(profileId) || {};
+    const next = {};
+    for (const t of pages) next[t.id] = { url: String(t.url || ''), title: String(t.title || '') };
+    const mem = this.memorySnapshot();
+    const now = Date.now();
+    const seen = this.tabCrashSeen;
+    for (const [id, cur] of Object.entries(next)) {
+      const old = prev[id];
+      const crash = this.isCrashTab(cur);
+      const key = `${profileId}/${id}`;
+      if (!old) {
+        this.appendRotating('tab-events.log', JSON.stringify({
+          ts: now, kind: crash ? 'tab-crash' : 'tab-created', profileId, targetId: id,
+          url: cur.url.slice(0, 200), title: cur.title.slice(0, 80), mem,
+        }));
+        if (crash) { seen.set(key, cur.url); this.freezeForensics(profileId, { id, url: cur.url }); }
+        continue;
+      }
+      if (old.url !== cur.url) {
+        this.appendRotating('tab-events.log', JSON.stringify({
+          ts: now, kind: crash ? 'tab-crash' : 'tab-url-changed', profileId, targetId: id,
+          from: old.url.slice(0, 200), to: cur.url.slice(0, 200), title: cur.title.slice(0, 80), mem,
+        }));
+        if (crash) { seen.set(key, cur.url); this.freezeForensics(profileId, { id, url: cur.url }); }
+        else seen.delete(key);
+      } else if (crash && seen.get(key) !== cur.url) {
+        this.appendRotating('tab-events.log', JSON.stringify({
+          ts: now, kind: 'tab-crash', profileId, targetId: id,
+          url: cur.url.slice(0, 200), title: cur.title.slice(0, 80), mem,
+        }));
+        seen.set(key, cur.url);
+      } else if (!crash) {
+        seen.delete(key);
+      }
+    }
+    for (const [id, old] of Object.entries(prev)) {
+      if (next[id]) continue;
+      this.appendRotating('tab-events.log', JSON.stringify({
+        ts: now, kind: 'tab-gone', profileId, targetId: id,
+        url: old.url.slice(0, 200), title: old.title.slice(0, 80), mem,
+      }));
+      seen.delete(`${profileId}/${id}`);
+    }
+    this.tabSnapshot.set(profileId, next);
+  }
+
   handleOplog(req, res) {
     const file = path.join(LOG_DIR, 'console-ops.log');
     let ops = [];
@@ -1050,7 +1147,7 @@ class ConsoleServer {
           cpuTicks: Number(rest[11]) + Number(rest[12]),
         });
       }
-      const line = JSON.stringify({ ts: Date.now(), profileId, targetId: target.id, url: (target.url || '').slice(0, 120), procs });
+      const line = JSON.stringify({ ts: Date.now(), profileId, targetId: target.id, url: (target.url || '').slice(0, 120), mem: this.memorySnapshot(), procs });
       fs.appendFileSync(path.join(LOG_DIR, 'freeze-forensics.log'), line + '\n');
     } catch (_) { /* ignore */ }
   }
@@ -1061,7 +1158,9 @@ class ConsoleServer {
     for (const [profileId, port] of this.refresher.active) {
       let pages;
       try { pages = await this.fetchUpstreamJson(port, '/json/list'); } catch (_) { continue; }
-      for (const t of (Array.isArray(pages) ? pages : []).filter((x) => x.type === 'page')) {
+      const pageList = (Array.isArray(pages) ? pages : []).filter((x) => x.type === 'page');
+      try { this.snapshotTabs(profileId, pageList); } catch (_) { /* 取证失败不影响守护 */ }
+      for (const t of pageList) {
         const key = `${profileId}/${t.id}`;
         const alive = await this.probePageAlive(port, t.id);
         if (alive) { this.hangFails.delete(key); continue; }

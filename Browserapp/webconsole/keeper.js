@@ -183,23 +183,75 @@ let memAvailAlerting = false;
 let memAvailLastAlert = 0;
 
 function memAvailableAlert() {
-  let availKb = NaN;
-  try {
-    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+) kB/m);
-    if (m) availKb = Number(m[1]);
-  } catch (_) { return; }
-  if (Number.isNaN(availKb)) return;
-  const availMb = Math.round(availKb / 1024);
+  let snap;
+  try { snap = readMemorySnapshot(); } catch (_) { return; }
+  const availMb = snap.availMb;
+  if (availMb === null || Number.isNaN(availMb)) return;
+  const psi = snap.psiSome10 == null ? '-' : snap.psiSome10;
   if (availMb < MEM_AVAIL_ALERT_MB) {
     memAvailAlerting = true;
     if (Date.now() - memAvailLastAlert >= MEM_AVAIL_COOLDOWN_MS) {
       memAvailLastAlert = Date.now();
-      log(`内存挤压告警：系统可用内存仅 ${availMb}MB（阈值 ${MEM_AVAIL_ALERT_MB}MB），气球抽干时进程可能无声死亡`);
+      log(`内存挤压告警：系统可用内存仅 ${availMb}MB（阈值 ${MEM_AVAIL_ALERT_MB}MB），swap 已用 ${snap.swapUsedMb}MB 剩余 ${snap.swapFreeMb}MB，PSI some10=${psi}，气球抽干时进程可能无声死亡`);
     }
   } else if (memAvailAlerting && availMb >= MEM_AVAIL_RECOVER_MB) {
     memAvailAlerting = false;
-    log(`内存恢复：系统可用内存回升至 ${availMb}MB`);
+    log(`内存恢复：系统可用内存回升至 ${availMb}MB（swap 已用 ${snap.swapUsedMb}MB，PSI some10=${psi}）`);
   }
+}
+
+// ===== 内存时序采样（只记录，供后续定位「实例被终止 / 页面回退」的触发条件）=====
+// 每次巡检（15s）写一行 JSON：可用内存、swap 使用、PSI 压力、各实例 RSS。
+// 与 logs/freeze-forensics.log、logs/tab-events.log 按时间戳对齐，即可判断是气球抽干、swap 抖动还是实例自身增长。
+const MEMORY_SAMPLES = '/home/openbrowser/.config/openbrowser/logs/memory-samples.log';
+const MEMORY_SAMPLES_MAX = 8 * 1024 * 1024;
+let lastSampleTs = 0;
+
+function readMemorySnapshot() {
+  const snap = {};
+  const mi = fs.readFileSync('/proc/meminfo', 'utf8');
+  const pick = (key) => {
+    const m = mi.match(new RegExp(`^${key}:\\s+(\\d+) kB`, 'm'));
+    return m ? Math.round(Number(m[1]) / 1024) : null;
+  };
+  snap.availMb = pick('MemAvailable');
+  snap.freeMb = pick('MemFree');
+  snap.cachedMb = pick('Cached');
+  const swapTotal = pick('SwapTotal');
+  const swapFree = pick('SwapFree');
+  snap.swapUsedMb = (swapTotal === null || swapFree === null) ? null : swapTotal - swapFree;
+  snap.swapFreeMb = swapFree;
+  snap.swapCachedMb = pick('SwapCached');
+  try {
+    const psi = fs.readFileSync('/proc/pressure/memory', 'utf8');
+    const some = psi.match(/some avg10=([\d.]+) avg60=([\d.]+) avg300=([\d.]+)/);
+    const full = psi.match(/full avg10=([\d.]+) avg60=([\d.]+) avg300=([\d.]+)/);
+    if (some) { snap.psiSome10 = Number(some[1]); snap.psiSome60 = Number(some[2]); snap.psiSome300 = Number(some[3]); }
+    if (full) { snap.psiFull10 = Number(full[1]); snap.psiFull60 = Number(full[2]); snap.psiFull300 = Number(full[3]); }
+  } catch (_) { /* 内核未开启 PSI */ }
+  return snap;
+}
+
+function sampleMemory() {
+  const now = Date.now();
+  const gapSec = lastSampleTs ? Math.round((now - lastSampleTs) / 1000) : 0;
+  lastSampleTs = now;
+  let snap;
+  try { snap = readMemorySnapshot(); } catch (_) { return; }
+  const inst = {};
+  let instTotalMb = null;
+  try {
+    for (const [id, bytes] of instanceMemoryMap()) inst[id] = Math.round(bytes / 1048576);
+    instTotalMb = Object.values(inst).reduce((sum, v) => sum + v, 0);
+  } catch (_) { /* ignore */ }
+  try {
+    fs.mkdirSync(path.dirname(MEMORY_SAMPLES), { recursive: true });
+    try {
+      if (fs.statSync(MEMORY_SAMPLES).size > MEMORY_SAMPLES_MAX) fs.renameSync(MEMORY_SAMPLES, `${MEMORY_SAMPLES}.1`);
+    } catch (_) { /* 首次写入 */ }
+    fs.appendFileSync(MEMORY_SAMPLES, JSON.stringify({ ts: now, gapSec, ...snap, instTotalMb, inst }) + '\n');
+  } catch (_) { /* ignore */ }
+  if (gapSec > 60) log(`巡检间隔异常 ${gapSec}s（疑似虚拟机挂起/恢复），已记入 memory-samples.log`);
 }
 
 // ===== 复活后按最后已知 URL 恢复任务页（B）=====
@@ -473,7 +525,8 @@ function instanceMemoryMap() {
     if (!/^\d+$/.test(d)) continue;
     let cmd = '';
     try { cmd = fs.readFileSync(`/proc/${d}/cmdline`, 'utf8'); } catch (_) { continue; }
-    const m = cmd.match(/browser-profiles-v2\/([^/\0]+)/);
+    // Chrome 会把自身 cmdline 重写成空格分隔，这里同时按空格与 NUL 截断，避免把参数并入实例 id
+    const m = cmd.match(/browser-profiles-v2\/([^/\s\0]+)/);
     if (!m) continue;
     let statm = '';
     try { statm = fs.readFileSync(`/proc/${d}/statm`, 'utf8'); } catch (_) { continue; }
@@ -533,6 +586,7 @@ async function seedState() {
 // ===== 主循环 =====
 
 async function loop() {
+  try { sampleMemory(); } catch (e) { log('mem-sample err:', e.message); }
   try { await ensureXvfb(); } catch (e) { log('xvfb err:', e.message); }
   let activeList = null;
   try { activeList = await ensureClient(); } catch (e) { log('client err:', e.message); }

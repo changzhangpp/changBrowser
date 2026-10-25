@@ -130,7 +130,8 @@ function spawnUser(cmd, args, cwd) {
   const child = spawn('setpriv', [
     '--reuid=1000', '--regid=1000', '--clear-groups', 'env',
     'HOME=/home/openbrowser', 'ELECTRON_DISABLE_SANDBOX=1', 'DISPLAY=:99',
-    'OPENBROWSER_NETLOG=1',
+    // netlog 只排障时开：keeper 自身带 OPENBROWSER_NETLOG=1 才透传，且写入受 trimNetlog 上限约束
+    ...(process.env.OPENBROWSER_NETLOG === '1' ? ['OPENBROWSER_NETLOG=1'] : []),
     cmd, ...args,
   ], { cwd, detached: true, stdio: 'ignore' });
   child.unref();
@@ -252,6 +253,27 @@ function sampleMemory() {
     fs.appendFileSync(MEMORY_SAMPLES, JSON.stringify({ ts: now, gapSec, ...snap, instTotalMb, inst }) + '\n');
   } catch (_) { /* ignore */ }
   if (gapSec > 60) log(`巡检间隔异常 ${gapSec}s（疑似虚拟机挂起/恢复），已记入 memory-samples.log`);
+}
+
+// ===== netlog 兜底限流 =====
+// 带 --log-net-log 启动的实例会一直往 profile 目录追加 netlog.json 且没有体积上限，
+// 长跑几天就能吃掉数 GB。这里超过 256MB 就地截断，保证磁盘不被写满（进程仍持有旧偏移，后续写入会出现稀疏空洞，占用依旧很小）。
+const NETLOG_MAX = 256 * 1024 * 1024;
+
+function trimNetlog() {
+  let dirs = [];
+  try { dirs = fs.readdirSync(PROFILES_DIR); } catch (_) { return; }
+  for (const d of dirs) {
+    const f = path.join(PROFILES_DIR, d, 'netlog.json');
+    try {
+      const st = fs.statSync(f);
+      // 截断后进程仍从旧偏移写，会形成稀疏文件：apparent size 很大但实际占用很小，必须按块判断
+      const allocMb = Math.round((st.blocks * 512) / 1048576);
+      if (allocMb <= NETLOG_MAX / 1048576) continue;
+      fs.truncateSync(f, 0);
+      log(`netlog 超限已截断：${d} 实际占用 ${allocMb}MB（表观 ${Math.round(st.size / 1048576)}MB）-> 0（上限 ${NETLOG_MAX / 1048576}MB）`);
+    } catch (_) { /* 不存在或无权限 */ }
+  }
 }
 
 // ===== 复活后按最后已知 URL 恢复任务页（B）=====
@@ -587,6 +609,7 @@ async function seedState() {
 
 async function loop() {
   try { sampleMemory(); } catch (e) { log('mem-sample err:', e.message); }
+  try { trimNetlog(); } catch (e) { log('netlog-trim err:', e.message); }
   try { await ensureXvfb(); } catch (e) { log('xvfb err:', e.message); }
   let activeList = null;
   try { activeList = await ensureClient(); } catch (e) { log('client err:', e.message); }

@@ -193,3 +193,12 @@ This file records user instructions, preferences, and teachings for reference in
   - 内存时序看 `~/.config/openbrowser/logs/memory-samples.log`：keeper 每 15s 一行 JSON（可用内存、swap、PSI、各实例 RSS），gapSec > 60 说明巡检被挂起
   - 进程卡死取证看 `freeze-forensics.log`（进程 D 状态与 wchan），页面操作看 `console-ops.log`，三者按 ts 对齐即可还原时间线
   - 已修 `instanceMemoryMap` 的实例 id 解析：Chrome 重写 cmdline 为空格分隔，旧正则会把参数并进实例 id，导致内存守护拿到非法 id
+
+[Project Knowledge Summary]
+- Date: 2026-10-25
+- Context: 磁盘占用 95% 的定位与处置
+- Category: Troubleshooting & Debugging / Operations & Deployment
+- Instructions:
+  - 磁盘大头曾是各实例 profile 下的 netlog.json（5 个共 8.8G）：keeper 曾硬编码 OPENBROWSER_NETLOG=1，Chrome `--log-net-log` 无体积上限，长跑 4 天即可写满
+  - 现已改为 keeper 自带 OPENBROWSER_NETLOG=1 才透传，并每 15s 巡检按**实际占用**（stat.blocks，不用表观 size）截断超过 256MB 的 netlog；截断后进程仍从旧偏移写，会形成稀疏文件，看 `du`/`df` 而不是 `ls -l`
+  - 只截断文件不会让运行中实例停止写：已启动的实例仍带旧参数，彻底停写需重启实例（新 spawn 才生效）

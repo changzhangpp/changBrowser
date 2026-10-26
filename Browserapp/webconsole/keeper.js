@@ -367,16 +367,21 @@ async function restoreInstancePage(id, waitedMs = 0) {
   const target = pages.find((t) => (t.url || '').includes(START_PAGE_HINT)) || pages[0];
   if ((target.url || '') === url) { log(`实例 ${id} 页面已在目标地址`); return; }
   const wsPath = (target.webSocketDebuggerUrl || '').replace(`ws://127.0.0.1:${port}`, '');
-  const ok = await cdpNavigate(port, wsPath, url);
-  if (!ok) { log(`实例 ${id} 页面恢复失败：CDP 导航未成功`); return; }
-  setTimeout(async () => {
+  // 刚复活的实例内嵌起始页还在加载，过早导航会被起始页覆盖：导航后复核，不一致就重试
+  const ATTEMPTS = 3, VERIFY_MS = 5000;
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
+    const ok = await cdpNavigate(port, wsPath, url);
+    if (!ok) { log(`实例 ${id} 页面恢复失败：CDP 导航未成功（第 ${attempt} 次）`); return; }
+    await new Promise((r) => setTimeout(r, VERIFY_MS));
+    let cur = '';
     try {
       const t2 = ((await httpGetJson(port, '/json/list')) || []).filter((t) => t.type === 'page');
-      const cur = (t2.find((t) => t.id === target.id) || t2[0] || {}).url || '';
-      if (cur.startsWith(url.split('#')[0])) log(`实例 ${id} 页面恢复确认: ${url.slice(0, 90)}`);
-      else log(`实例 ${id} 页面恢复未确认，当前: ${cur.slice(0, 90)}`);
-    } catch (_) { log(`实例 ${id} 页面恢复复核失败`); }
-  }, 4000);
+      cur = (t2.find((t) => t.id === target.id) || t2[0] || {}).url || '';
+    } catch (_) { log(`实例 ${id} 页面恢复复核失败（第 ${attempt} 次）`); continue; }
+    if (cur.startsWith(url.split('#')[0])) { log(`实例 ${id} 页面恢复确认: ${url.slice(0, 90)}`); return; }
+    log(`实例 ${id} 页面恢复未确认（第 ${attempt}/${ATTEMPTS} 次），当前: ${cur.slice(0, 90)}`);
+  }
+  log(`实例 ${id} 页面恢复放弃：${ATTEMPTS} 次导航均被覆盖`);
 }
 
 // ===== 各服务恢复动作 =====
